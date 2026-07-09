@@ -1,13 +1,15 @@
+/** Classifies ACP tool permission requests into auto-approved and prompt-required risk buckets. */
 import { homedir } from "node:os";
 import path from "node:path";
-import { isKnownCoreToolId } from "../agents/tool-catalog.js";
-import { isMutatingToolCall } from "../agents/tool-mutation.js";
-import { isPathInside } from "../infra/path-guards.js";
+import { asRecord } from "@openclaw/acp-core/record-shared";
 import {
   normalizeLowercaseStringOrEmpty,
   normalizeOptionalString,
-} from "../shared/string-coerce.js";
-import { asRecord } from "./record-shared.js";
+} from "@openclaw/normalization-core/string-coerce";
+import { isKnownCoreToolId } from "../agents/tool-catalog.js";
+import { isMutatingToolCall } from "../agents/tool-mutation.js";
+import { isPathInside } from "../infra/path-guards.js";
+import { readTrimmedStringAlias } from "../utils/string-readers.js";
 
 const SAFE_SEARCH_TOOL_IDS = new Set(["search", "web_search", "memory_search"]);
 const TRUSTED_SAFE_TOOL_ALIASES = new Set(["search"]);
@@ -51,13 +53,7 @@ function readFirstStringValue(
   if (!source) {
     return undefined;
   }
-  for (const key of keys) {
-    const value = normalizeOptionalString(source[key]);
-    if (value) {
-      return value;
-    }
-  }
-  return undefined;
+  return readTrimmedStringAlias(source, keys);
 }
 
 function normalizeToolName(value: string): string | undefined {
@@ -185,6 +181,7 @@ function isReadToolCallScopedToCwd(
   return isPathInside(path.resolve(cwd), absolutePath);
 }
 
+/** Resolves the ACP approval class for one tool call, failing closed on spoofed tool identity. */
 export function classifyAcpToolApproval(params: {
   toolCall?: {
     title?: string | null;

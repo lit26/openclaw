@@ -1,3 +1,4 @@
+// Tests session maintenance warning formatting and suppression.
 import { randomUUID } from "node:crypto";
 import { afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 
@@ -197,5 +198,41 @@ describe("deliverSessionMaintenanceWarning", () => {
       expectedMaintenanceWarning("older than 1 second"),
       { sessionKey: params.sessionKey },
     ]);
+  });
+
+  it.each([
+    [59_500, "60 seconds", "1 minute"],
+    [3_570_000, "60 minutes", "1 hour"],
+    [86_370_000, "24 hours", "1 day"],
+  ])(
+    "formatDuration rolls over %dms to next unit instead of %s",
+    async (pruneAfterMs, _buggyOutput, expected) => {
+      mocks.deliverOutboundPayloads.mockRejectedValueOnce(new Error("force system event"));
+      const params = createParams({
+        warning: { pruneAfterMs, wouldPrune: true, wouldCap: false, maxEntries: 100 } as never,
+      });
+
+      await deliverSessionMaintenanceWarning(params);
+
+      expect(firstSystemEventCall()?.[0]).toContain(`older than ${expected}`);
+    },
+  );
+
+  it.each([
+    [30_000, "30 seconds"],
+    [89_500, "1 minute"],
+    [1_800_000, "30 minutes"],
+    [5_370_000, "1 hour"],
+    [43_200_000, "12 hours"],
+    [129_570_000, "1 day"],
+  ])("formatDuration keeps %dms in its own unit as %s", async (pruneAfterMs, expected) => {
+    mocks.deliverOutboundPayloads.mockRejectedValueOnce(new Error("force system event"));
+    const params = createParams({
+      warning: { pruneAfterMs, wouldPrune: true, wouldCap: false, maxEntries: 100 } as never,
+    });
+
+    await deliverSessionMaintenanceWarning(params);
+
+    expect(firstSystemEventCall()?.[0]).toContain(`older than ${expected}`);
   });
 });

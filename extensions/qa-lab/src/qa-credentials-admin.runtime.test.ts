@@ -1,4 +1,8 @@
-import { describe, expect, it, vi } from "vitest";
+// Qa Lab tests cover qa credentials admin plugin behavior.
+import http from "node:http";
+import type { AddressInfo } from "node:net";
+import { MAX_TIMER_TIMEOUT_MS } from "openclaw/plugin-sdk/number-runtime";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import {
   addQaCredentialSet,
   diagnoseQaCredentialBroker,
@@ -52,6 +56,10 @@ async function expectQaCredentialAdminError(promise: Promise<unknown>, code: str
 }
 
 describe("qa credential admin runtime", () => {
+  afterEach(() => {
+    vi.restoreAllMocks();
+  });
+
   it("adds a credential set through the admin endpoint", async () => {
     const fetchImpl = vi.fn(async (_input: RequestInfo | URL, _init?: RequestInit) =>
       jsonResponse({
@@ -151,6 +159,30 @@ describe("qa credential admin runtime", () => {
     );
   });
 
+  it("caps oversized admin HTTP timeouts before creating abort signals", async () => {
+    const timeoutController = new AbortController();
+    const timeoutSpy = vi.spyOn(AbortSignal, "timeout").mockReturnValue(timeoutController.signal);
+    const fetchImpl = vi.fn(async (_input: RequestInfo | URL, _init?: RequestInit) =>
+      jsonResponse({
+        status: "ok",
+        count: 0,
+        credentials: [],
+      }),
+    );
+
+    await listQaCredentialSets({
+      siteUrl: "https://first-schnauzer-821.convex.site",
+      env: {
+        OPENCLAW_QA_CONVEX_SECRET_MAINTAINER: "maint-secret",
+        OPENCLAW_QA_CREDENTIAL_HTTP_TIMEOUT_MS: String(Number.MAX_SAFE_INTEGER),
+      },
+      fetchImpl,
+    });
+
+    expect(timeoutSpy).toHaveBeenCalledWith(MAX_TIMER_TIMEOUT_MS);
+    expect(requireFirstFetchInit(fetchImpl).signal).toBe(timeoutController.signal);
+  });
+
   it("rejects unsafe endpoint-prefix overrides", async () => {
     await expectQaCredentialAdminError(
       listQaCredentialSets({
@@ -236,6 +268,70 @@ describe("qa credential admin runtime", () => {
       includePayload: true,
       limit: 5,
     });
+  });
+
+  it("rejects and cancels oversized streamed admin responses", async () => {
+    const chunk = Buffer.alloc(64 * 1024, "x");
+    const totalChunks = 64;
+    let chunksSent = 0;
+    let responseClosed = false;
+    const server = http.createServer((_req, res) => {
+      res.writeHead(200, { "content-type": "application/json" });
+      let nextChunkTimer: ReturnType<typeof setTimeout> | undefined;
+      res.once("close", () => {
+        responseClosed = true;
+        if (nextChunkTimer) {
+          clearTimeout(nextChunkTimer);
+        }
+      });
+      const scheduleNext = () => {
+        nextChunkTimer = setTimeout(sendNext, 2);
+      };
+      const sendNext = () => {
+        if (res.destroyed || chunksSent >= totalChunks) {
+          if (!res.destroyed) {
+            res.end();
+          }
+          return;
+        }
+        chunksSent += 1;
+        if (res.write(chunk)) {
+          scheduleNext();
+        } else {
+          res.once("drain", scheduleNext);
+        }
+      };
+      sendNext();
+    });
+    await new Promise<void>((resolve, reject) => {
+      server.once("error", reject);
+      server.listen(0, "127.0.0.1", resolve);
+    });
+    const port = (server.address() as AddressInfo).port;
+
+    try {
+      const error = await listQaCredentialSets({
+        siteUrl: `http://127.0.0.1:${port}`,
+        env: {
+          OPENCLAW_QA_ALLOW_INSECURE_HTTP: "1",
+          OPENCLAW_QA_CONVEX_SECRET_MAINTAINER: "maint-secret",
+        },
+      }).then(
+        () => undefined,
+        (err: unknown) => err,
+      );
+
+      expect(error).toBeInstanceOf(QaCredentialAdminError);
+      const adminError = error as QaCredentialAdminError;
+      expect(adminError.code).toBe("BROKER_REQUEST_FAILED");
+      expect(adminError.message).toMatch(/Convex credential admin response exceeds/);
+      await vi.waitFor(() => expect(responseClosed).toBe(true));
+      expect(chunksSent).toBeLessThan(totalChunks);
+    } finally {
+      await new Promise<void>((resolve) => {
+        server.close(() => resolve());
+      });
+    }
   });
 
   it("doctors credential broker env without exposing secret values", async () => {

@@ -1,3 +1,4 @@
+// Codex tests cover attempt client cleanup plugin behavior.
 import { describe, expect, it, vi } from "vitest";
 import {
   interruptCodexTurnBestEffort,
@@ -31,7 +32,7 @@ describe("Codex app-server attempt client cleanup", () => {
         threadId: "thread-1",
         timeoutMs: 123,
       }),
-    ).resolves.toBeUndefined();
+    ).resolves.toBe(false);
 
     expect(request).toHaveBeenCalledWith(
       "thread/unsubscribe",

@@ -1,3 +1,4 @@
+// Discord provider module implements model/runtime integration.
 import { inspect } from "node:util";
 import {
   parseStrictFiniteNumber,
@@ -186,7 +187,7 @@ export function formatDiscordDeployErrorMessage(err: unknown): string {
   return `Discord REST ${operation} was aborted${timingText}`;
 }
 
-export function resolveDiscordDeployRateLimitDetails(
+function resolveDiscordDeployRateLimitDetails(
   err: unknown,
 ): DiscordDeployRateLimitDetails | undefined {
   if (!err || typeof err !== "object") {
@@ -336,7 +337,7 @@ export function formatDiscordDeployErrorDetails(err: unknown): string {
     details.push(`code=${discordCode}`);
   }
   if (rawBody !== undefined) {
-    let bodyText = "";
+    let bodyText;
     try {
       bodyText = JSON.stringify(rawBody);
     } catch {

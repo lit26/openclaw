@@ -12,14 +12,8 @@ Message presentation is OpenClaw's shared contract for rich outbound chat UI.
 It lets agents, CLI commands, approval flows, and plugins describe the message
 intent once, while each channel plugin renders the best native shape it can.
 
-Use presentation for portable message UI:
-
-- text sections
-- small context/footer text
-- dividers
-- buttons
-- select menus
-- card title and tone
+Use presentation for portable message UI: text sections, small context/footer
+text, dividers, buttons, select menus, and card title/tone.
 
 Do not add new provider-native fields such as Discord `components`, Slack
 `blocks`, Telegram `buttons`, Teams `card`, or Feishu `card` to the shared
@@ -52,8 +46,14 @@ type MessagePresentationBlock =
   | { type: "buttons"; buttons: MessagePresentationButton[] }
   | { type: "select"; placeholder?: string; options: MessagePresentationOption[] };
 
+type MessagePresentationAction =
+  | { type: "command"; command: string }
+  | { type: "callback"; value: string };
+
 type MessagePresentationButton = {
   label: string;
+  action?: MessagePresentationAction;
+  /** Legacy callback value. Prefer action for new controls. */
   value?: string;
   url?: string;
   webApp?: { url: string };
@@ -67,7 +67,9 @@ type MessagePresentationButton = {
 
 type MessagePresentationOption = {
   label: string;
-  value: string;
+  action?: MessagePresentationAction;
+  /** Legacy callback value. Prefer action for new controls. */
+  value?: string;
 };
 
 type ReplyPayloadDelivery = {
@@ -83,8 +85,13 @@ type ReplyPayloadDelivery = {
 
 Button semantics:
 
-- `value` is an application action value routed back through the channel's
-  existing interaction path when the channel supports clickable controls.
+- `action.type: "command"` runs a native slash command through core's command
+  path. Use this for built-in command buttons and menus.
+- `action.type: "callback"` carries opaque plugin data through the channel's
+  interaction path. Channel plugins must not reinterpret callback data as slash
+  commands.
+- `value` is the legacy opaque callback value. New controls should use `action`
+  so channel plugins can map commands and callbacks without guessing from text.
 - `url` is a link button. It can exist without `value`.
 - `webApp` describes a channel-native web app button. Telegram renders this
   as `web_app` and only supports it in private chats. `web_app` is still
@@ -98,7 +105,9 @@ Button semantics:
   original order among equal priority buttons. When all controls fit, authored
   order is preserved.
 - `disabled` is optional. Channels must opt in with `supportsDisabled`; otherwise
-  core degrades the disabled control to non-interactive fallback text.
+  core degrades the disabled control to non-interactive fallback text. A
+  disabled button always renders label-only in fallback text, even when it
+  carries a `command` action.
 - `reusable` is optional. Channels that support reusable native callbacks may
   keep the action available after a successful interaction. Use it for
   repeatable or idempotent actions such as refresh, inspect, or more details;
@@ -106,7 +115,8 @@ Button semantics:
 
 Select semantics:
 
-- `options[].value` is the selected application value.
+- `options[].action` has the same command/callback meaning as button `action`.
+- `options[].value` is the legacy selected application value.
 - `placeholder` is advisory and may be ignored by channels without native
   select support.
 - If a channel does not support selects, fallback text lists the labels.
@@ -330,6 +340,26 @@ Fallback text includes:
 - button labels, including URLs for link buttons
 - select option labels
 
+### Button value fallback visibility
+
+When a channel cannot render interactive controls, button and select values
+fall back to plain text. The fallback behavior preserves usability while
+keeping opaque callback data private:
+
+- **`command`-typed actions** render as `label: \`command\`` so users can
+  copy the command and run it manually in the channel input.
+- **`callback`-typed actions** and legacy **`value`** fields render as
+  label-only. The opaque callback value is not exposed in fallback text.
+- **`url` / `webApp`** buttons render the URL text alongside the button
+  label, since the URL is user-facing.
+- **Select options** render as label-only. The underlying option value is not
+  exposed in fallback text.
+
+Channel adapters that add manual-command guidance in their fallback UI (e.g.
+Feishu document-comment instructions) must derive the command-present check
+from the same presentation blocks that the fallback renderer uses, so the
+guidance text only appears when a manual command is actually shown.
+
 Unsupported native controls should degrade rather than fail the whole send.
 Examples:
 
@@ -345,15 +375,16 @@ required and the channel cannot pin the sent message, delivery reports failure.
 
 Current bundled renderers:
 
-| Channel         | Native render target                | Notes                                                                                                                                             |
-| --------------- | ----------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------- |
-| Discord         | Components and component containers | Preserves legacy `channelData.discord.components` for existing provider-native payload producers, but new shared sends should use `presentation`. |
-| Slack           | Block Kit                           | Preserves legacy `channelData.slack.blocks` for existing provider-native payload producers, but new shared sends should use `presentation`.       |
-| Telegram        | Text plus inline keyboards          | Buttons/selects require inline button capability for the target surface; otherwise text fallback is used.                                         |
-| Mattermost      | Text plus interactive props         | Other blocks degrade to text.                                                                                                                     |
-| Microsoft Teams | Adaptive Cards                      | Plain `message` text is included with the card when both are provided.                                                                            |
-| Feishu          | Interactive cards                   | Card header can use `title`; body avoids duplicating that title.                                                                                  |
-| Plain channels  | Text fallback                       | Channels without a renderer still get readable output.                                                                                            |
+| Channel         | Native render target                      | Notes                                                                                                                                                                                                             |
+| --------------- | ----------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Discord         | Components and component containers       | Preserves legacy `channelData.discord.components` for existing provider-native payload producers, but new shared sends should use `presentation`.                                                                 |
+| Feishu          | Interactive cards                         | Card header can use `title`; body avoids duplicating that title.                                                                                                                                                  |
+| Matrix          | Text fallback plus structured event field | Buttons/selects advertise as supported, but every block currently renders as `renderMessagePresentationFallbackText` output carried in a `com.openclaw.presentation` event field, not native interactive widgets. |
+| Mattermost      | Text plus interactive props               | Selects and dividers are not supported; those blocks degrade to text.                                                                                                                                             |
+| Microsoft Teams | Adaptive Cards                            | Plain `message` text is included with the card when both are provided. Selects, styles, and disabled state are not supported.                                                                                     |
+| Slack           | Block Kit                                 | Preserves legacy `channelData.slack.blocks` for existing provider-native payload producers, but new shared sends should use `presentation`.                                                                       |
+| Telegram        | Text plus inline keyboards                | Buttons/selects require inline button capability for the target surface; otherwise text fallback is used.                                                                                                         |
+| Plain channels  | Text fallback                             | Channels without a renderer still get readable output.                                                                                                                                                            |
 
 Provider-native payload compatibility is a transition affordance for existing
 reply producers. It is not a reason to add new shared native fields.
@@ -383,18 +414,34 @@ code:
 import {
   adaptMessagePresentationForChannel,
   applyPresentationActionLimits,
+  hasMessagePresentationBlocks,
   interactiveReplyToPresentation,
+  isMessagePresentationInteractiveBlock,
   normalizeMessagePresentation,
   presentationPageSize,
   presentationToInteractiveControlsReply,
   presentationToInteractiveReply,
   renderMessagePresentationFallbackText,
+  resolveMessagePresentationActionValue,
+  resolveMessagePresentationControlValue,
 } from "openclaw/plugin-sdk/interactive-runtime";
 ```
 
 New code should accept or produce `MessagePresentation` directly. Existing
 `interactive` payloads are a deprecated subset of `presentation`; runtime
 support remains for older producers.
+
+Non-deprecated helpers worth knowing:
+
+- `normalizeMessagePresentation(raw)` / `hasMessagePresentationBlocks(value)`
+  validate and coerce an untyped payload (for example, JSON from the CLI
+  `--presentation` flag) into `MessagePresentation`.
+- `isMessagePresentationInteractiveBlock(block)` narrows a block to the
+  `buttons` | `select` union.
+- `resolveMessagePresentationActionValue(action)` /
+  `resolveMessagePresentationControlValue(control)` read the effective
+  command/callback value off an `action`, falling back to the legacy `value`
+  field for `resolveMessagePresentationControlValue`.
 
 The legacy `InteractiveReply*` types and conversion helpers are marked
 `@deprecated` in the SDK:

@@ -1,7 +1,8 @@
+// Isolated agent session identity tests cover stable session ids for cron runs.
 import "./isolated-agent.mocks.js";
 import fs from "node:fs/promises";
 import path from "node:path";
-import { beforeEach, describe, expect, it, vi } from "vitest";
+import { beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 import * as modelThinkingDefault from "../agents/model-thinking-default.js";
 import type { SessionEntry } from "../config/sessions.js";
 import { runCronIsolatedAgentTurn } from "./isolated-agent.js";
@@ -23,7 +24,10 @@ import {
 import { setupRunCronIsolatedAgentTurnSuite } from "./isolated-agent/run.suite-helpers.js";
 import {
   dispatchCronDeliveryMock,
+  makeCronSession,
   mockRunCronFallbackPassthrough,
+  resetRunCronIsolatedAgentTurnHarness,
+  resolveCronSessionMock,
   runEmbeddedAgentMock,
   updateSessionStoreMock,
 } from "./isolated-agent/run.test-harness.js";
@@ -60,6 +64,16 @@ function lastEmbeddedAgentCall(): {
 }
 
 describe("runCronIsolatedAgentTurn session identity", () => {
+  beforeAll(async () => {
+    resetRunCronIsolatedAgentTurnHarness();
+    resolveCronSessionMock.mockReturnValue(makeCronSession());
+    vi.spyOn(modelThinkingDefault, "resolveThinkingDefault").mockReturnValue("off");
+    mockRunCronFallbackPassthrough();
+    await withTempHome(async (home) => {
+      await runCronTurn(home, { jobPayload: DEFAULT_AGENT_TURN_PAYLOAD });
+    });
+  });
+
   beforeEach(() => {
     vi.spyOn(modelThinkingDefault, "resolveThinkingDefault").mockReturnValue("off");
     runEmbeddedAgentMock.mockClear();
@@ -213,8 +227,13 @@ describe("runCronIsolatedAgentTurn session identity", () => {
 
       const finalPersist = updateSessionStoreMock.mock.calls.at(-1);
       expect(finalPersist?.[0]).toBe(storePath);
-      const persistedStore: Record<string, { [key: string]: unknown }> = {};
-      (finalPersist?.[1] as (store: typeof persistedStore) => void)(persistedStore);
+      // Replay the final persist against the real post-run store: the claim
+      // guard rejects writes into a store that never held the session.
+      const persistedStore = JSON.parse(await fs.readFile(storePath, "utf-8")) as Record<
+        string,
+        { [key: string]: unknown }
+      >;
+      (finalPersist![1] as (store: typeof persistedStore) => void)(persistedStore);
       expect(persistedStore[boundSessionKey]).toEqual(
         expect.objectContaining({
           sessionId: "bound-session-rotated",

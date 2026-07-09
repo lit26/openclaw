@@ -1,3 +1,4 @@
+// Interactive payload tests cover validation of interactive response payloads.
 import { describe, expect, it } from "vitest";
 import {
   hasReplyChannelData,
@@ -165,6 +166,63 @@ describe("interactive payload helpers", () => {
     );
   });
 
+  it("normalizes typed presentation actions and bridges them to legacy values", () => {
+    const normalized = normalizeMessagePresentation({
+      blocks: [
+        {
+          type: "buttons",
+          buttons: [
+            {
+              label: "Plugins",
+              action: { type: "command", command: "/codex plugins menu" },
+            },
+            {
+              label: "Approve",
+              action: { type: "callback", value: "/approve req allow-once" },
+            },
+          ],
+        },
+      ],
+    });
+
+    expect(normalized).toEqual({
+      blocks: [
+        {
+          type: "buttons",
+          buttons: [
+            {
+              label: "Plugins",
+              action: { type: "command", command: "/codex plugins menu" },
+            },
+            {
+              label: "Approve",
+              action: { type: "callback", value: "/approve req allow-once" },
+            },
+          ],
+        },
+      ],
+    });
+    expect(presentationToInteractiveReply(normalized!)).toEqual({
+      blocks: [
+        {
+          type: "buttons",
+          buttons: [
+            {
+              label: "Plugins",
+              action: { type: "command", command: "/codex plugins menu" },
+              value: "/codex plugins menu",
+            },
+            {
+              label: "Approve",
+              action: { type: "callback", value: "/approve req allow-once" },
+              value: "/approve req allow-once",
+            },
+          ],
+        },
+      ],
+    });
+  });
+
   it("converts only presentation controls for native component renderers", () => {
     const presentation = {
       title: "Deploy approval",
@@ -218,6 +276,39 @@ describe("interactive payload helpers", () => {
         },
       ],
     });
+  });
+
+  it("preserves command values in button fallback text while keeping callback values private", () => {
+    const presentation = {
+      blocks: [
+        {
+          type: "buttons" as const,
+          buttons: [
+            { label: "Approve", value: "/approve req_1 allow-once" },
+            { label: "Deny", action: { type: "command" as const, command: "/approve req_1 deny" } },
+            { label: "Ignore", action: { type: "callback" as const, value: "ignore_123" } },
+            { label: "Docs", url: "https://example.com/docs" },
+            { label: "Disabled", disabled: true },
+            {
+              label: "DisabledCmd",
+              disabled: true,
+              action: { type: "command" as const, command: "/test" },
+            },
+          ],
+        },
+      ],
+    };
+
+    expect(renderMessagePresentationFallbackText({ presentation })).toBe(
+      [
+        "- Approve",
+        "- Deny: `/approve req_1 deny`",
+        "- Ignore",
+        "- Docs: https://example.com/docs",
+        "- Disabled",
+        "- DisabledCmd",
+      ].join("\n"),
+    );
   });
 
   it("keeps divider-only fallback empty unless a send transport fallback is requested", () => {

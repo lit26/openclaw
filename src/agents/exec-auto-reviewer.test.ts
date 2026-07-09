@@ -1,7 +1,16 @@
+// Exec auto-reviewer tests cover model response parsing, low-risk allow gates,
+// reviewer prompt isolation, and timeout resolution.
+import { MAX_TIMER_TIMEOUT_MS } from "@openclaw/normalization-core/number-coercion";
 import { describe, expect, it, vi } from "vitest";
-import { createModelExecAutoReviewer, parseExecAutoReviewResponse } from "./exec-auto-reviewer.js";
+import {
+  createModelExecAutoReviewer,
+  parseExecAutoReviewResponse,
+  resolveExecReviewerTimeoutMs,
+} from "./exec-auto-reviewer.js";
 
 const input = {
+  // Baseline approval request is read-only; individual cases override command
+  // text or analysis fields to exercise escalation behavior.
   command: "git status",
   argv: ["git", "status"],
   cwd: "/repo",
@@ -49,6 +58,8 @@ describe("parseExecAutoReviewResponse", () => {
   });
 
   it("normalizes unsupported or malformed decisions to human review", () => {
+    // Reviewer output is untrusted model text; only a bare JSON object matching
+    // the allow/ask schema can affect approval flow.
     expect(parseExecAutoReviewResponse("sure, run it")).toMatchObject({
       decision: "ask",
     });
@@ -106,6 +117,24 @@ describe("parseExecAutoReviewResponse", () => {
         rationale: "exec reviewer returned a non-low allow decision",
       });
     }
+  });
+
+  it("does not split surrogate pairs when truncating rationale", () => {
+    const rationale = "x".repeat(499) + "🚀tail";
+
+    expect(
+      parseExecAutoReviewResponse(
+        JSON.stringify({
+          decision: "ask",
+          risk: "medium",
+          rationale,
+        }),
+      ),
+    ).toEqual({
+      decision: "ask",
+      risk: "medium",
+      rationale: "x".repeat(499),
+    });
   });
 });
 
@@ -173,6 +202,8 @@ describe("createModelExecAutoReviewer", () => {
   });
 
   it("defers to human approval when command text tries to instruct the reviewer", async () => {
+    // Command content is adversarial input to the reviewer. Prompt-injection
+    // attempts force human review even if the model returns a low-risk allow.
     const prepare = vi.fn(async () => ({
       selection: {
         provider: "openrouter",
@@ -302,6 +333,12 @@ describe("createModelExecAutoReviewer", () => {
     } finally {
       vi.useRealTimers();
     }
+  });
+
+  it("caps oversized reviewer timeouts before scheduling timers", () => {
+    expect(resolveExecReviewerTimeoutMs({ timeoutMs: Number.MAX_SAFE_INTEGER })).toBe(
+      MAX_TIMER_TIMEOUT_MS,
+    );
   });
 
   it("gives reviewer completion a fresh timeout after slow model preparation", async () => {

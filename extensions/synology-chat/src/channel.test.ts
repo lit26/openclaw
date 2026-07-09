@@ -1,3 +1,4 @@
+// Synology Chat tests cover channel plugin behavior.
 import { verifyChannelMessageAdapterCapabilityProofs } from "openclaw/plugin-sdk/channel-outbound";
 import { createPluginSetupWizardStatus } from "openclaw/plugin-sdk/plugin-test-runtime";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
@@ -74,6 +75,65 @@ describe("createSynologyChatPlugin", () => {
       expect(plugin.meta.id).toBe("synology-chat");
       expect(plugin.meta.label).toBe("Synology Chat");
       expect(plugin.meta.docsPath).toBe("/channels/synology-chat");
+    });
+  });
+
+  describe("messaging", () => {
+    it("isolates stable Chat API recipients from inbound webhook identities", async () => {
+      const plugin = createSynologyChatPlugin();
+      const route = await plugin.messaging?.resolveOutboundSessionRoute?.({
+        cfg: {},
+        agentId: "ops",
+        accountId: "work",
+        target: "synology-chat:42",
+      });
+
+      expect(route).toEqual({
+        sessionKey: "agent:ops:synology-chat:work:direct:chat-api-42",
+        baseSessionKey: "agent:ops:synology-chat:work:direct:chat-api-42",
+        recipientSessionExact: "delivery-identity",
+        peer: { kind: "direct", id: "chat-api-42" },
+        chatType: "direct",
+        from: "synology-chat:chat-api:42",
+        to: "42",
+      });
+    });
+
+    it("rejects non-numeric Chat API recipients for session routing", async () => {
+      const plugin = createSynologyChatPlugin();
+      const route = await plugin.messaging?.resolveOutboundSessionRoute?.({
+        cfg: {},
+        agentId: "ops",
+        target: "synology-chat:alice",
+      });
+
+      expect(route).toBeNull();
+    });
+
+    it("canonicalizes safe Chat API recipient IDs", async () => {
+      const plugin = createSynologyChatPlugin();
+      const route = await plugin.messaging?.resolveOutboundSessionRoute?.({
+        cfg: {},
+        agentId: "ops",
+        target: "synology_chat:+00042",
+      });
+
+      expect(route).toMatchObject({
+        sessionKey: "agent:ops:synology-chat:default:direct:chat-api-42",
+        peer: { kind: "direct", id: "chat-api-42" },
+        to: "42",
+      });
+    });
+
+    it("rejects Chat API recipient IDs beyond the safe integer range", async () => {
+      const plugin = createSynologyChatPlugin();
+      const route = await plugin.messaging?.resolveOutboundSessionRoute?.({
+        cfg: {},
+        agentId: "ops",
+        target: "9007199254740992",
+      });
+
+      expect(route).toBeNull();
     });
   });
 

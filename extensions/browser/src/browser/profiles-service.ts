@@ -1,3 +1,9 @@
+/**
+ * Browser profile service.
+ *
+ * Implements profile listing, creation, and deletion using browser config
+ * mutation helpers and route context runtime state.
+ */
 import fs from "node:fs";
 import path from "node:path";
 import { normalizeOptionalString } from "openclaw/plugin-sdk/string-coerce-runtime";
@@ -18,7 +24,8 @@ import { isValidProfileName } from "./profiles.js";
 import type { BrowserRouteContext, ProfileStatus } from "./server-context.js";
 import { movePathToTrash } from "./trash.js";
 
-export type CreateProfileParams = {
+/** Input accepted when creating a browser profile. */
+type CreateProfileParams = {
   name: string;
   color?: string;
   cdpUrl?: string;
@@ -26,7 +33,8 @@ export type CreateProfileParams = {
   driver?: "openclaw" | "existing-session";
 };
 
-export type CreateProfileResult = {
+/** Result returned after creating a browser profile. */
+type CreateProfileResult = {
   ok: true;
   profile: string;
   transport: "cdp" | "chrome-mcp";
@@ -37,7 +45,8 @@ export type CreateProfileResult = {
   isRemote: boolean;
 };
 
-export type DeleteProfileResult = {
+/** Result returned after deleting a browser profile. */
+type DeleteProfileResult = {
   ok: true;
   profile: string;
   deleted: boolean;
@@ -45,6 +54,7 @@ export type DeleteProfileResult = {
 
 const HEX_COLOR_RE = /^#[0-9A-Fa-f]{6}$/;
 
+/** Create a profile service bound to one browser route context. */
 export function createBrowserProfilesService(ctx: BrowserRouteContext) {
   const listProfiles = async (): Promise<ProfileStatus[]> => {
     return await ctx.listProfiles();
@@ -91,11 +101,6 @@ export function createBrowserProfilesService(ctx: BrowserRouteContext) {
     }
 
     if (rawCdpUrl) {
-      if (driver === "existing-session") {
-        throw new BrowserValidationError(
-          "driver=existing-session does not accept cdpUrl; it attaches via the Chrome MCP auto-connect flow",
-        );
-      }
       let parsed: ReturnType<typeof parseHttpUrl>;
       try {
         parsed = parseHttpUrl(rawCdpUrl, "browser.profiles.cdpUrl");
@@ -129,7 +134,7 @@ export function createBrowserProfilesService(ctx: BrowserRouteContext) {
       profile: name,
       transport: capabilities.usesChromeMcp ? "chrome-mcp" : "cdp",
       cdpPort: capabilities.usesChromeMcp ? null : resolved.cdpPort,
-      cdpUrl: capabilities.usesChromeMcp ? null : resolved.cdpUrl,
+      cdpUrl: resolved.cdpUrl || null,
       userDataDir: resolved.userDataDir ?? null,
       color: resolved.color,
       isRemote: !resolved.cdpIsLoopback,

@@ -1,3 +1,4 @@
+// Browser tests cover pw session.get page for targetid.extension fallback plugin behavior.
 import { chromium } from "playwright-core";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import * as chromeModule from "./chrome.js";
@@ -5,6 +6,7 @@ import {
   closePlaywrightBrowserConnection,
   getPageForTargetId,
   listPagesViaPlaywright,
+  setCdpConnectRetryDelayMsForTests,
 } from "./pw-session.js";
 
 const connectOverCdpSpy = vi.spyOn(chromium, "connectOverCDP");
@@ -42,7 +44,6 @@ function requireFetchInit(init: Parameters<typeof fetch>[1]): FetchInitWithDispa
 }
 
 function makeBrowser(pages: MockPageSpec[]): BrowserMockBundle {
-  let context: import("playwright-core").BrowserContext;
   const browserClose = vi.fn(async () => {});
   const targetIdByPage = new Map<import("playwright-core").Page, string | undefined>();
 
@@ -57,7 +58,7 @@ function makeBrowser(pages: MockPageSpec[]): BrowserMockBundle {
     return page;
   });
 
-  context = {
+  const context: import("playwright-core").BrowserContext = {
     pages: () => pageObjects,
     on: vi.fn(),
     newCDPSession: vi.fn(async (page: import("playwright-core").Page) => ({
@@ -83,6 +84,7 @@ function makeBrowser(pages: MockPageSpec[]): BrowserMockBundle {
 afterEach(async () => {
   connectOverCdpSpy.mockReset();
   getChromeWebSocketUrlSpy.mockReset();
+  setCdpConnectRetryDelayMsForTests();
   await closePlaywrightBrowserConnection().catch(() => {});
 });
 
@@ -144,13 +146,15 @@ describe("pw-session getPageForTargetId", () => {
       urls: ["https://alpha.example", "https://beta.example"],
     }).pages;
 
-    const fetchSpy = vi.spyOn(globalThis, "fetch").mockResolvedValue({
-      ok: true,
-      json: async () => [
-        { id: "TARGET_A", url: "https://alpha.example" },
-        { id: "TARGET_B", url: "https://beta.example" },
-      ],
-    } as Response);
+    const fetchSpy = vi.spyOn(globalThis, "fetch").mockResolvedValue(
+      new Response(
+        JSON.stringify([
+          { id: "TARGET_A", url: "https://alpha.example" },
+          { id: "TARGET_B", url: "https://beta.example" },
+        ]),
+        { headers: { "content-type": "application/json" } },
+      ),
+    );
 
     try {
       const resolved = await getPageForTargetId({
@@ -178,13 +182,15 @@ describe("pw-session getPageForTargetId", () => {
     });
     const [, pageB] = pages;
 
-    const fetchSpy = vi.spyOn(globalThis, "fetch").mockResolvedValue({
-      ok: true,
-      json: async () => [
-        { id: "TARGET_A", url: "https://alpha.example" },
-        { id: "TARGET_B", url: "https://beta.example" },
-      ],
-    } as Response);
+    const fetchSpy = vi.spyOn(globalThis, "fetch").mockResolvedValue(
+      new Response(
+        JSON.stringify([
+          { id: "TARGET_A", url: "https://alpha.example" },
+          { id: "TARGET_B", url: "https://beta.example" },
+        ]),
+        { headers: { "content-type": "application/json" } },
+      ),
+    );
 
     try {
       const resolved = await getPageForTargetId({
@@ -258,6 +264,7 @@ describe("pw-session getPageForTargetId", () => {
   });
 
   it("does not add an extra top-level retry for non-recoverable connect failures", async () => {
+    setCdpConnectRetryDelayMsForTests(0);
     connectOverCdpSpy.mockRejectedValue(new Error("connectOverCDP exploded"));
     getChromeWebSocketUrlSpy.mockResolvedValue(null);
 

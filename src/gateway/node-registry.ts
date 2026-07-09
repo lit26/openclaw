@@ -1,8 +1,17 @@
+// Gateway node registry.
+// Tracks connected node clients, invoke requests, broadcasts, and system.run approvals.
 import { randomUUID } from "node:crypto";
+import {
+  addTimerTimeoutGraceMs,
+  isFutureDateTimestampMs,
+  resolveExpiresAtMsFromDurationMs,
+  resolveTimerTimeoutMs,
+} from "@openclaw/normalization-core/number-coercion";
 import { logRejectedLargePayload } from "../logging/diagnostic-payload.js";
 import { MAX_BUFFERED_BYTES } from "./server-constants.js";
 import type { GatewayWsClient } from "./server/ws-types.js";
 
+/** Connected node session advertised over Gateway websocket. */
 export type NodeSession = {
   nodeId: string;
   connId: string;
@@ -18,8 +27,10 @@ export type NodeSession = {
   modelIdentifier?: string;
   remoteIp?: string;
   declaredCaps: string[];
+  sessionCapsCeiling?: string[];
   caps: string[];
   declaredCommands: string[];
+  sessionCommandsCeiling?: string[];
   commands: string[];
   declaredPermissions?: Record<string, boolean>;
   permissions?: Record<string, boolean>;
@@ -27,6 +38,7 @@ export type NodeSession = {
   connectedAtMs: number;
 };
 
+/** Pending invoke awaiting a node.invoke.response. */
 type PendingInvoke = {
   nodeId: string;
   connId: string;
@@ -37,18 +49,21 @@ type PendingInvoke = {
   timer: ReturnType<typeof setTimeout>;
 };
 
+/** system.run metadata remembered while waiting for node events. */
 type PendingSystemRunEvent = {
   runId: string;
   sessionKey?: string;
   timeoutMs?: number | null;
 };
 
+/** Authorized system.run event window bound to one node connection. */
 type AuthorizedSystemRunEvent = PendingSystemRunEvent & {
   nodeId: string;
   connId: string;
   expiresAtMs: number | null;
 };
 
+/** Result payload returned from node.invoke. */
 type NodeInvokeResult = {
   ok: boolean;
   payload?: unknown;
@@ -56,10 +71,12 @@ type NodeInvokeResult = {
   error?: { code?: string; message?: string } | null;
 };
 
+/** Connectivity probe result for a registered node. */
 type NodeConnectivityResult =
   | { ok: true }
   | { ok: false; error: { code: string; message: string } };
 
+/** Minimal websocket ping/pong surface used by connectivity checks. */
 type PingableSocket = {
   readyState?: number;
   ping?: (data?: Buffer, mask?: boolean, cb?: (err?: Error) => void) => void;
@@ -81,14 +98,16 @@ export type SerializedEventPayload = {
   readonly [SERIALIZED_EVENT_PAYLOAD]: true;
 };
 
+/** Serialize an event payload once so fanout can reuse the same JSON string. */
 export function serializeEventPayload(payload: unknown): SerializedEventPayload | null {
-  if (!payload) {
+  if (payload === undefined) {
     return null;
   }
   const json = JSON.stringify(payload);
   return typeof json === "string" ? { json, [SERIALIZED_EVENT_PAYLOAD]: true } : null;
 }
 
+/** Narrow values created by serializeEventPayload. */
 function isSerializedEventPayload(value: unknown): value is SerializedEventPayload {
   return (
     typeof value === "object" &&
@@ -98,10 +117,12 @@ function isSerializedEventPayload(value: unknown): value is SerializedEventPaylo
   );
 }
 
+/** Normalize optional string-ish websocket fields. */
 function normalizeString(value: unknown): string {
   return typeof value === "string" ? value.trim() : "";
 }
 
+/** Normalize system.run timeout values, preserving null for no expiry. */
 function normalizeSystemRunTimeoutMs(value: unknown): number | null | undefined {
   if (value === undefined) {
     return undefined;
@@ -110,9 +131,10 @@ function normalizeSystemRunTimeoutMs(value: unknown): number | null | undefined 
     return undefined;
   }
   const timeoutMs = Math.trunc(value);
-  return timeoutMs > 0 ? timeoutMs : null;
+  return timeoutMs > 0 ? resolveTimerTimeoutMs(timeoutMs, 1) : null;
 }
 
+/** Extract system.run event auth metadata from invoke params. */
 function resolvePendingSystemRunEvent(params: {
   command: string;
   params?: unknown;
@@ -134,6 +156,7 @@ function resolvePendingSystemRunEvent(params: {
   };
 }
 
+/** Ensure system.run requests have a runId before they are sent to a node. */
 function withSystemRunEventRunId(params: { command: string; params?: unknown }): unknown {
   if (
     params.command !== "system.run" ||
@@ -150,12 +173,14 @@ function withSystemRunEventRunId(params: { command: string; params?: unknown }):
   return { ...obj, runId: randomUUID() };
 }
 
+/** Registry of currently connected Gateway nodes. */
 export class NodeRegistry {
   private nodesById = new Map<string, NodeSession>();
   private nodesByConn = new Map<string, string>();
   private pendingInvokes = new Map<string, PendingInvoke>();
   private authorizedSystemRunEvents = new Map<string, AuthorizedSystemRunEvent>();
 
+  /** Register a websocket client as the current connection for its node id. */
   register(client: GatewayWsClient, opts: { remoteIp?: string | undefined }) {
     const connect = client.connect;
     const nodeId = connect.device?.id ?? connect.client.id;
@@ -171,6 +196,18 @@ export class NodeRegistry {
     )
       ? ((connect as { declaredCommands?: string[] }).declaredCommands ?? [])
       : commands;
+    // Session ceilings preserve protocol compatibility across later pairing
+    // approvals while declared* retains the durable approval surface.
+    const sessionCapsCeiling = Array.isArray(
+      (connect as { sessionCapsCeiling?: string[] }).sessionCapsCeiling,
+    )
+      ? ((connect as { sessionCapsCeiling?: string[] }).sessionCapsCeiling ?? [])
+      : declaredCaps;
+    const sessionCommandsCeiling = Array.isArray(
+      (connect as { sessionCommandsCeiling?: string[] }).sessionCommandsCeiling,
+    )
+      ? ((connect as { sessionCommandsCeiling?: string[] }).sessionCommandsCeiling ?? [])
+      : declaredCommands;
     const permissions =
       typeof (connect as { permissions?: Record<string, boolean> }).permissions === "object"
         ? ((connect as { permissions?: Record<string, boolean> }).permissions ?? undefined)
@@ -200,8 +237,10 @@ export class NodeRegistry {
       modelIdentifier: connect.client.modelIdentifier,
       remoteIp: opts.remoteIp,
       declaredCaps,
+      sessionCapsCeiling,
       caps,
       declaredCommands,
+      sessionCommandsCeiling,
       commands,
       declaredPermissions,
       permissions,
@@ -213,6 +252,7 @@ export class NodeRegistry {
     return session;
   }
 
+  /** Unregister one connection and reject invokes tied to that connection. */
   unregister(connId: string): string | null {
     const nodeId = this.nodesByConn.get(connId);
     if (!nodeId) {
@@ -239,14 +279,17 @@ export class NodeRegistry {
     return unregistersCurrentNode ? nodeId : null;
   }
 
+  /** List connected node sessions. */
   listConnected(): NodeSession[] {
     return [...this.nodesById.values()];
   }
 
+  /** Return a connected node session by node id. */
   get(nodeId: string): NodeSession | undefined {
     return this.nodesById.get(nodeId);
   }
 
+  /** Probe websocket liveness with ping/pong when the socket supports it. */
   async checkConnectivity(nodeId: string, timeoutMs = 2_000): Promise<NodeConnectivityResult> {
     const node = this.nodesById.get(nodeId);
     if (!node) {
@@ -334,10 +377,6 @@ export class NodeRegistry {
     });
   }
 
-  updateCommands(nodeId: string, commands: readonly string[]): NodeSession | null {
-    return this.updateSurface(nodeId, { commands });
-  }
-
   updateSurface(
     nodeId: string,
     surface: {
@@ -351,14 +390,17 @@ export class NodeRegistry {
       return null;
     }
 
-    const declaredCommands = new Set(node.declaredCommands);
-    const nextCommands = surface.commands.filter((command) => declaredCommands.has(command));
+    // Runtime approvals can only narrow capabilities/commands/permissions declared at connect.
+    const sessionCommandsCeiling = new Set(node.sessionCommandsCeiling ?? node.declaredCommands);
+    const nextCommands = surface.commands.filter((command) => sessionCommandsCeiling.has(command));
     node.commands = nextCommands;
     (node.client.connect as { commands?: string[] }).commands = nextCommands;
 
     if ("caps" in surface) {
-      const declaredCaps = new Set(node.declaredCaps);
-      const nextCaps = (surface.caps ?? []).filter((capability) => declaredCaps.has(capability));
+      const sessionCapsCeiling = new Set(node.sessionCapsCeiling ?? node.declaredCaps);
+      const nextCaps = (surface.caps ?? []).filter((capability) =>
+        sessionCapsCeiling.has(capability),
+      );
       node.caps = nextCaps;
       (node.client.connect as { caps?: string[] }).caps = nextCaps;
     }
@@ -440,7 +482,7 @@ export class NodeRegistry {
         ...systemRunEvent,
       });
     }
-    const timeoutMs = typeof params.timeoutMs === "number" ? params.timeoutMs : 30_000;
+    const timeoutMs = resolveTimerTimeoutMs(params.timeoutMs, 30_000, 0);
     return await new Promise<NodeInvokeResult>((resolve, reject) => {
       const timer = setTimeout(() => {
         this.pendingInvokes.delete(requestId);
@@ -461,6 +503,7 @@ export class NodeRegistry {
     });
   }
 
+  /** Authorize an inbound system.run event against a recently issued node invoke. */
   authorizeSystemRunEvent(params: {
     nodeId: string;
     connId?: string;
@@ -473,7 +516,7 @@ export class NodeRegistry {
     }
     const connId = params.connId;
     this.pruneAuthorizedSystemRunEvents();
-    let match: { key: string; event: AuthorizedSystemRunEvent } | null = null;
+    let match: { key: string; event: AuthorizedSystemRunEvent } | null;
     if (params.runId) {
       match = this.matchAuthorizedSystemRunEvent({
         nodeId: params.nodeId,
@@ -528,7 +571,8 @@ export class NodeRegistry {
     if (typeof timeoutMs !== "number") {
       return null;
     }
-    return Date.now() + timeoutMs + AUTHORIZED_SYSTEM_RUN_EVENT_GRACE_MS;
+    const durationMs = addTimerTimeoutGraceMs(timeoutMs, AUTHORIZED_SYSTEM_RUN_EVENT_GRACE_MS);
+    return resolveExpiresAtMsFromDurationMs(durationMs) ?? 0;
   }
 
   private matchAuthorizedSystemRunEvent(params: {
@@ -590,7 +634,10 @@ export class NodeRegistry {
 
   private pruneAuthorizedSystemRunEvents(now = Date.now()): void {
     for (const [key, event] of this.authorizedSystemRunEvents) {
-      if (event.expiresAtMs !== null && event.expiresAtMs <= now) {
+      if (
+        event.expiresAtMs !== null &&
+        !isFutureDateTimestampMs(event.expiresAtMs, { nowMs: now })
+      ) {
         this.authorizedSystemRunEvents.delete(key);
       }
     }

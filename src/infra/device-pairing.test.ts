@@ -1,3 +1,4 @@
+// Covers device pairing, token, and role lifecycle behavior.
 import { mkdir, readFile, writeFile } from "node:fs/promises";
 import { afterAll, beforeAll, describe, expect, test } from "vitest";
 import { PAIRING_SETUP_BOOTSTRAP_PROFILE } from "../shared/device-bootstrap-profile.js";
@@ -6,7 +7,6 @@ import { issueDeviceBootstrapToken, verifyDeviceBootstrapToken } from "./device-
 import {
   approveBootstrapDevicePairing,
   approveDevicePairing,
-  clearDevicePairing,
   ensureDeviceToken,
   getPairedDevice,
   hasEffectivePairedDeviceRole,
@@ -293,6 +293,50 @@ describe("device pairing tokens", () => {
     expect(second.request.ts).toBe(originalTs);
   });
 
+  test("re-requests keep one pending request alive past the pending TTL without churning requestIds", async () => {
+    // Regression: a device retrying all night must not mint a new requestId (and a
+    // new approval prompt broadcast) every TTL window. Refreshes stamp refreshedAtMs
+    // as a TTL keepalive while ts stays the creation time for approval ordering.
+    const baseDir = await makeDevicePairingDir();
+    const req = {
+      deviceId: "device-1",
+      publicKey: "public-key-1",
+      role: "operator" as const,
+      scopes: ["operator.read"],
+    };
+    const first = await requestDevicePairing(req, baseDir);
+    const refreshed = await requestDevicePairing(req, baseDir);
+    expect(refreshed.created).toBe(false);
+
+    // Simulate hours of aging since creation while retries kept the keepalive fresh.
+    const paths = resolvePairingPaths(baseDir, "devices");
+    const pendingById = JSON.parse(await readFile(paths.pendingPath, "utf8")) as Record<
+      string,
+      { ts: number; refreshedAtMs?: number }
+    >;
+    const pending = requireValue(
+      pendingById[first.request.requestId],
+      "expected pending pairing request",
+    );
+    expect(pending.refreshedAtMs).toBeGreaterThanOrEqual(pending.ts);
+    const createdTs = Date.now() - 60 * 60 * 1000;
+    pending.ts = createdTs;
+    await writeFile(paths.pendingPath, JSON.stringify(pendingById, null, 2));
+
+    const third = await requestDevicePairing(req, baseDir);
+    expect(third.created).toBe(false);
+    expect(third.request.requestId).toBe(first.request.requestId);
+    expect(third.request.ts).toBe(createdTs);
+    // The keepalive is store-internal; it must not leak into protocol payloads.
+    expect("refreshedAtMs" in third.request).toBe(false);
+
+    // A stale keepalive still expires the request.
+    pending.refreshedAtMs = createdTs;
+    pendingById[first.request.requestId] = pending;
+    await writeFile(paths.pendingPath, JSON.stringify(pendingById, null, 2));
+    expect((await listDevicePairing(baseDir)).pending).toHaveLength(0);
+  });
+
   test("supersedes pending requests when requested roles/scopes change", async () => {
     const baseDir = await makeDevicePairingDir();
     const first = await requestDevicePairing(
@@ -316,6 +360,9 @@ describe("device pairing tokens", () => {
 
     expect(second.created).toBe(true);
     expect(second.request.requestId).not.toBe(first.request.requestId);
+    expect(second.superseded).toEqual([
+      { requestId: first.request.requestId, deviceId: "device-1" },
+    ]);
     expect(second.request.role).toBe("operator");
     expectArrayIncludesAll(second.request.roles, ["node", "operator"], "request roles");
     expectArrayIncludesAll(
@@ -789,6 +836,95 @@ describe("device pairing tokens", () => {
     });
   });
 
+  test("approval access metadata initializes paired device last-seen fields", async () => {
+    const baseDir = await makeDevicePairingDir();
+    const request = await requestDevicePairing(
+      {
+        deviceId: "node-1",
+        publicKey: "public-key-node-1",
+        role: "node",
+        scopes: [],
+        displayName: "pending-name",
+        remoteIp: "127.0.0.1",
+      },
+      baseDir,
+    );
+    const firstSeenAtMs = Date.now();
+
+    const approved = await approveDevicePairing(
+      request.request.requestId,
+      {
+        callerScopes: [],
+        accessMetadata: {
+          displayName: "connected-name",
+          remoteIp: "10.0.0.1",
+          lastSeenAtMs: firstSeenAtMs,
+          lastSeenReason: "connect",
+        },
+      },
+      baseDir,
+    );
+    expectRecordFields(approved, "approved result", { status: "approved" });
+
+    const paired = await getPairedDevice("node-1", baseDir);
+    expectRecordFields(paired, "paired device", {
+      displayName: "connected-name",
+      remoteIp: "10.0.0.1",
+      lastSeenAtMs: firstSeenAtMs,
+      lastSeenReason: "connect",
+    });
+  });
+
+  test("repair approvals preserve paired device last-seen fields without access metadata", async () => {
+    const baseDir = await makeDevicePairingDir();
+    await setupPairedNodeDevice(baseDir);
+    await updatePairedDeviceMetadata(
+      "node-1",
+      {
+        lastSeenAtMs: 1234,
+        lastSeenReason: "bg_app_refresh",
+      },
+      baseDir,
+    );
+
+    const repair = await requestDevicePairing(
+      {
+        deviceId: "node-1",
+        publicKey: "public-key-node-1",
+        role: "node",
+        scopes: [],
+      },
+      baseDir,
+    );
+    await approveDevicePairing(repair.request.requestId, { callerScopes: [] }, baseDir);
+
+    const paired = await getPairedDevice("node-1", baseDir);
+    expectRecordFields(paired, "paired device", {
+      lastSeenAtMs: 1234,
+      lastSeenReason: "bg_app_refresh",
+    });
+  });
+
+  test("device token verification refreshes paired device last-seen metadata", async () => {
+    const { baseDir, token } = await setupOperatorToken(["operator.read"]);
+    const beforeVerifyAtMs = Date.now();
+
+    await expect(
+      verifyDeviceToken({
+        deviceId: "device-1",
+        token,
+        role: "operator",
+        scopes: ["operator.read"],
+        baseDir,
+      }),
+    ).resolves.toEqual({ ok: true });
+
+    const paired = await getPairedDevice("device-1", baseDir);
+    expect(paired?.lastSeenReason).toBe("device-token-auth");
+    expect(typeof paired?.lastSeenAtMs).toBe("number");
+    expect(paired?.lastSeenAtMs ?? 0).toBeGreaterThanOrEqual(beforeVerifyAtMs);
+  });
+
   test("generates base64url device tokens with 256-bit entropy output length", async () => {
     const baseDir = await makeDevicePairingDir();
     await setupPairedOperatorDevice(baseDir, ["operator.admin"]);
@@ -1249,6 +1385,44 @@ describe("device pairing tokens", () => {
     expect(paired?.tokens?.operator).toBeUndefined();
   });
 
+  test("bootstrap approval access metadata initializes paired device last-seen fields", async () => {
+    const baseDir = await makeDevicePairingDir();
+    const request = await requestDevicePairing(
+      {
+        deviceId: "bootstrap-device-seen",
+        publicKey: "bootstrap-public-key-seen",
+        role: "node",
+        roles: ["node"],
+        scopes: [],
+        silent: true,
+        remoteIp: "127.0.0.1",
+      },
+      baseDir,
+    );
+    const firstSeenAtMs = Date.now();
+
+    const approved = await approveBootstrapDevicePairing(
+      request.request.requestId,
+      PAIRING_SETUP_BOOTSTRAP_PROFILE,
+      {
+        accessMetadata: {
+          remoteIp: "10.0.0.2",
+          lastSeenAtMs: firstSeenAtMs,
+          lastSeenReason: "connect",
+        },
+      },
+      baseDir,
+    );
+    expectRecordFields(approved, "approved result", { status: "approved" });
+
+    const paired = await getPairedDevice("bootstrap-device-seen", baseDir);
+    expectRecordFields(paired, "paired device", {
+      remoteIp: "10.0.0.2",
+      lastSeenAtMs: firstSeenAtMs,
+      lastSeenReason: "connect",
+    });
+  });
+
   test("baseline bootstrap pairing issues bounded operator token when requested by QR handoff", async () => {
     const baseDir = await makeDevicePairingDir();
     const request = await requestDevicePairing(
@@ -1689,6 +1863,37 @@ describe("device pairing tokens", () => {
     expect(hasEffectivePairedDeviceRole(device, "node")).toBe(false);
   });
 
+  test("normalizes non-string entries while updating persisted approvals", async () => {
+    const baseDir = await makeDevicePairingDir();
+    await setupPairedOperatorDevice(baseDir, ["operator.read"]);
+    await mutatePairedDevice(baseDir, "device-1", (device) => {
+      device.roles = ["operator", undefined, null, 42, ""] as unknown as string[];
+      device.scopes = ["operator.read", undefined, null, 42, ""] as unknown as string[];
+      device.approvedScopes = ["operator.read", undefined, null, 42, ""] as unknown as string[];
+    });
+
+    const pending = await requestDevicePairing(
+      {
+        deviceId: "device-1",
+        publicKey: "public-key-1",
+        role: "operator",
+        scopes: ["operator.admin"],
+      },
+      baseDir,
+    );
+    const approved = await approveDevicePairing(
+      pending.request.requestId,
+      { callerScopes: ["operator.read", "operator.admin"] },
+      baseDir,
+    );
+
+    expect(approved?.status).toBe("approved");
+    const paired = await getPairedDevice("device-1", baseDir);
+    expect(paired?.roles).toEqual(["operator"]);
+    expect(paired?.approvedScopes).toEqual(["operator.read", "operator.admin"]);
+    expect(paired && listEffectivePairedDeviceRoles(paired)).toEqual(["operator"]);
+  });
+
   test("rejects rotating a token for a role that was never approved", async () => {
     const baseDir = await makeDevicePairingDir();
     await setupPairedOperatorDevice(baseDir, ["operator.pairing"]);
@@ -1775,14 +1980,5 @@ describe("device pairing tokens", () => {
       approveDevicePairing(request.request.requestId, { callerScopes: [] }, baseDir),
     ).rejects.toThrow(/paired\.json/);
     await expect(readFile(pairedPath, "utf8")).resolves.toBe("{not-json}");
-  });
-
-  test("clears paired device state by device id", async () => {
-    const baseDir = await makeDevicePairingDir();
-    await setupPairedOperatorDevice(baseDir, ["operator.read"]);
-
-    await expect(clearDevicePairing("device-1", baseDir)).resolves.toBe(true);
-    await expect(getPairedDevice("device-1", baseDir)).resolves.toBeNull();
-    await expect(clearDevicePairing("device-1", baseDir)).resolves.toBe(false);
   });
 });

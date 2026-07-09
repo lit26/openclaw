@@ -1,12 +1,15 @@
+// Gateway node command policy.
+// Computes per-platform allowlists from built-in, plugin, runtime, and config inputs.
+import { normalizeOptionalLowercaseString } from "@openclaw/normalization-core/string-coerce";
+import { normalizeUniqueStringEntries } from "@openclaw/normalization-core/string-normalization";
 import type { OpenClawConfig } from "../config/types.openclaw.js";
 import {
   NODE_BROWSER_PROXY_COMMAND,
+  NODE_EXEC_APPROVALS_COMMANDS,
   NODE_SYSTEM_NOTIFY_COMMAND,
   NODE_SYSTEM_RUN_COMMANDS,
 } from "../infra/node-commands.js";
-import { getActiveRuntimePluginRegistry } from "../plugins/active-runtime-registry.js";
-import { normalizeOptionalLowercaseString } from "../shared/string-coerce.js";
-import { normalizeUniqueStringEntries } from "../shared/string-normalization.js";
+import { getActivePluginGatewayNodePolicyRegistry } from "../plugins/runtime.js";
 import { normalizeDeviceMetadataForPolicy } from "./device-metadata-normalization.js";
 import type { NodeSession } from "./node-registry.js";
 
@@ -21,7 +24,12 @@ const NOTIFICATION_COMMANDS = ["notifications.list"];
 const ANDROID_NOTIFICATION_COMMANDS = [...NOTIFICATION_COMMANDS, "notifications.actions"];
 
 const DEVICE_COMMANDS = ["device.info", "device.status"];
-const ANDROID_DEVICE_COMMANDS = [...DEVICE_COMMANDS, "device.permissions", "device.health"];
+const ANDROID_DEVICE_COMMANDS = [
+  ...DEVICE_COMMANDS,
+  "device.permissions",
+  "device.health",
+  "device.apps",
+];
 
 const CONTACTS_COMMANDS = ["contacts.search"];
 const CONTACTS_DANGEROUS_COMMANDS = ["contacts.add"];
@@ -47,11 +55,13 @@ const IOS_SYSTEM_COMMANDS = [NODE_SYSTEM_NOTIFY_COMMAND];
 
 const SYSTEM_COMMANDS = [
   ...NODE_SYSTEM_RUN_COMMANDS,
+  ...NODE_EXEC_APPROVALS_COMMANDS,
   NODE_SYSTEM_NOTIFY_COMMAND,
   NODE_BROWSER_PROXY_COMMAND,
 ];
 const DESKTOP_HOST_COMMANDS = new Set<string>([
   ...NODE_SYSTEM_RUN_COMMANDS,
+  ...NODE_EXEC_APPROVALS_COMMANDS,
   NODE_BROWSER_PROXY_COMMAND,
   ...SCREEN_COMMANDS,
 ]);
@@ -214,15 +224,15 @@ function normalizePlatformId(platform?: string, deviceFamily?: string): Platform
 }
 
 export function listDangerousPluginNodeCommands(): string[] {
-  const registry = getActiveRuntimePluginRegistry();
+  const registry = getActivePluginGatewayNodePolicyRegistry();
   if (!registry) {
     return [];
   }
   const commands = [
-    ...(registry.nodeHostCommands ?? [])
+    ...registry.nodeHostCommands
       .filter((entry) => entry.command.dangerous === true)
       .map((entry) => entry.command.command),
-    ...(registry.nodeInvokePolicies ?? [])
+    ...registry.nodeInvokePolicies
       .filter((entry) => entry.policy.dangerous === true)
       .flatMap((entry) => entry.policy.commands),
   ];
@@ -230,11 +240,11 @@ export function listDangerousPluginNodeCommands(): string[] {
 }
 
 function listDefaultPluginNodeCommands(platformId: PlatformId): string[] {
-  const registry = getActiveRuntimePluginRegistry();
+  const registry = getActivePluginGatewayNodePolicyRegistry();
   if (!registry) {
     return [];
   }
-  const commands = (registry.nodeInvokePolicies ?? []).flatMap((entry) => {
+  const commands = registry.nodeInvokePolicies.flatMap((entry) => {
     if (entry.policy.dangerous === true) {
       return [];
     }
@@ -245,7 +255,7 @@ function listDefaultPluginNodeCommands(platformId: PlatformId): string[] {
 }
 
 export function isForegroundRestrictedPluginNodeCommand(command: string): boolean {
-  const registry = getActiveRuntimePluginRegistry();
+  const registry = getActivePluginGatewayNodePolicyRegistry();
   if (!registry) {
     return false;
   }
@@ -253,11 +263,37 @@ export function isForegroundRestrictedPluginNodeCommand(command: string): boolea
   if (!normalized) {
     return false;
   }
-  return (registry.nodeInvokePolicies ?? []).some(
+  return registry.nodeInvokePolicies.some(
     (entry) =>
       entry.policy.foregroundRestrictedOnIos === true &&
       entry.policy.commands.some((policyCommand) => policyCommand.trim() === normalized),
   );
+}
+
+export function filterLegacyNodeProtocolFeatures(params: {
+  caps: readonly string[];
+  commands: readonly string[];
+  pluginSurfaces: readonly string[];
+}): { caps: string[]; commands: string[] } {
+  // N-1 nodes predate plugin-hosted surfaces. Preserve their durable pairing
+  // declarations elsewhere, but hide unusable plugin features from this session.
+  const registry = getActivePluginGatewayNodePolicyRegistry();
+  if (!registry) {
+    return { caps: [...params.caps], commands: [...params.commands] };
+  }
+  const pluginIds = new Set([
+    ...registry.nodeHostCommands.map((entry) => entry.pluginId),
+    ...registry.nodeInvokePolicies.map((entry) => entry.pluginId),
+  ]);
+  const pluginCaps = new Set([...params.pluginSurfaces, ...pluginIds]);
+  const pluginCommands = new Set([
+    ...registry.nodeHostCommands.map((entry) => entry.command.command),
+    ...registry.nodeInvokePolicies.flatMap((entry) => entry.policy.commands),
+  ]);
+  return {
+    caps: params.caps.filter((cap) => !pluginCaps.has(cap)),
+    commands: params.commands.filter((command) => !pluginCommands.has(command)),
+  };
 }
 
 type NodeCommandPolicyNode = Pick<NodeSession, "platform" | "deviceFamily"> &
@@ -287,6 +323,8 @@ function filterApprovedRuntimeCommands(params: {
   if (!isDesktopPlatformId(params.platformId)) {
     return [];
   }
+  // Desktop host commands are not default-enabled for normal node sessions.
+  // A live node can still expose approved commands from its runtime handshake.
   return params.commands.filter((command) => DESKTOP_HOST_COMMANDS.has(command.trim()));
 }
 
@@ -333,6 +371,8 @@ function resolveNodeCommandAllowlistInternal(
   const extra = cfg.gateway?.nodes?.allowCommands ?? [];
   const deny = new Set(cfg.gateway?.nodes?.denyCommands ?? []);
   const dangerousPluginCommands = new Set(listDangerousPluginNodeCommands());
+  // Dangerous plugin commands are excluded from plugin defaults. Explicit
+  // gateway.nodes.allowCommands below can still opt them in for operators.
   const allow = new Set(
     [...base, ...talkCommands, ...pluginDefaults, ...approved, ...extra]
       .map((cmd) => cmd.trim())

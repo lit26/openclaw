@@ -1,3 +1,4 @@
+// Msteams plugin module implements messenger behavior.
 import {
   isSilentReplyText,
   SILENT_REPLY_TOKEN,
@@ -44,7 +45,7 @@ import { sendMSTeamsActivityWithReference } from "./sdk-proactive.js";
 import type { MSTeamsActivityLike } from "./sdk-types.js";
 import type { MSTeamsApp } from "./sdk.js";
 
-export type MSTeamsConversationReference = {
+type MSTeamsConversationReference = {
   activityId?: string;
   user?: { id?: string; name?: string; aadObjectId?: string };
   agent?: { id?: string; name?: string; aadObjectId?: string } | null;
@@ -66,7 +67,7 @@ export type MSTeamsConversationReference = {
   aadObjectId?: string;
 };
 
-export type MSTeamsReplyRenderOptions = {
+type MSTeamsReplyRenderOptions = {
   textChunkLimit: number;
   chunkText?: boolean;
   mediaMode?: "split" | "inline";
@@ -83,13 +84,13 @@ export type MSTeamsRenderedMessage = {
   mediaUrl?: string;
 };
 
-export type MSTeamsSendRetryOptions = {
+type MSTeamsSendRetryOptions = {
   maxAttempts?: number;
   baseDelayMs?: number;
   maxDelayMs?: number;
 };
 
-export type MSTeamsSendRetryEvent = {
+type MSTeamsSendRetryEvent = {
   messageIndex: number;
   messageCount: number;
   nextAttempt: number;
@@ -442,8 +443,10 @@ export async function sendMSTeamsMessages(params: {
       return await sendOnce();
     }
 
-    let attempt = 1;
-    while (true) {
+    for (const attempt of Array.from(
+      { length: retryOptions.maxAttempts },
+      (_, index) => index + 1,
+    )) {
       try {
         return await sendOnce();
       } catch (err) {
@@ -465,9 +468,9 @@ export async function sendMSTeamsMessages(params: {
         });
 
         await sleep(delayMs);
-        attempt = nextAttempt;
       }
     }
+    throw new Error("unreachable Teams send retry loop exit");
   };
 
   const sendMessageInContext = async (

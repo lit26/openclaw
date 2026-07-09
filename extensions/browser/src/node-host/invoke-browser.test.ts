@@ -1,3 +1,5 @@
+// Browser tests cover invoke browser plugin behavior.
+import { MAX_TIMER_TIMEOUT_MS } from "openclaw/plugin-sdk/number-runtime";
 import { beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 
 const controlServiceMocks = vi.hoisted(() => ({
@@ -56,7 +58,10 @@ vi.mock("../sdk-node-runtime.js", () => ({
           new Promise<never>((_, reject) => {
             abortCtrl.signal.addEventListener(
               "abort",
-              () => reject(abortCtrl.signal.reason ?? timeoutError),
+              () =>
+                reject(
+                  toLintErrorObject(abortCtrl.signal.reason ?? timeoutError, "Non-Error rejection"),
+                ),
               { once: true },
             );
           }),
@@ -284,11 +289,16 @@ describe("runBrowserProxyCommand", () => {
     await result;
   });
 
-  it("keeps non-timeout browser errors intact", async () => {
-    dispatcherMocks.dispatch.mockResolvedValue({
-      status: 500,
-      body: { error: "tab not found" },
-    });
+  it.each([
+    { status: 500, body: { error: "tab not found" }, expected: "500: tab not found" },
+    {
+      status: 404,
+      body: { error: 'tab not found: browser tab "abc"' },
+      expected: "404: tab not found",
+    },
+    { status: 503, body: { error: "" }, expected: "HTTP 503" },
+  ])("preserves browser response status in errors: $expected", async (response) => {
+    dispatcherMocks.dispatch.mockResolvedValue(response);
 
     await expect(
       runBrowserProxyCommand(
@@ -299,7 +309,7 @@ describe("runBrowserProxyCommand", () => {
           timeoutMs: 50,
         }),
       ),
-    ).rejects.toThrow("tab not found");
+    ).rejects.toThrow(response.expected);
   });
 
   it("rejects unauthorized query.profile when allowProfiles is configured", async () => {
@@ -452,6 +462,29 @@ describe("runBrowserProxyCommand", () => {
     expect(request.query).toEqual({ profile: "openclaw" });
   });
 
+  it("caps browser proxy command timeout before dispatch", async () => {
+    dispatcherMocks.dispatch.mockResolvedValue({
+      status: 200,
+      body: { ok: true },
+    });
+    const timeoutSpy = vi
+      .spyOn(globalThis, "setTimeout")
+      .mockReturnValue(1 as unknown as ReturnType<typeof setTimeout>);
+
+    try {
+      await runBrowserProxyCommand(
+        JSON.stringify({
+          method: "GET",
+          path: "/snapshot",
+          timeoutMs: Number.MAX_SAFE_INTEGER,
+        }),
+      );
+      expect(timeoutSpy).toHaveBeenCalledWith(expect.any(Function), MAX_TIMER_TIMEOUT_MS);
+    } finally {
+      timeoutSpy.mockRestore();
+    }
+  });
+
   it("rejects persistent profile creation when allowProfiles is empty", async () => {
     await expect(
       runBrowserProxyCommand(
@@ -466,3 +499,17 @@ describe("runBrowserProxyCommand", () => {
     expect(dispatcherMocks.dispatch).not.toHaveBeenCalled();
   });
 });
+
+function toLintErrorObject(value: unknown, fallbackMessage: string): Error {
+  if (value instanceof Error) {
+    return value;
+  }
+  if (typeof value === "string") {
+    return new Error(value);
+  }
+  const error = new Error(fallbackMessage, { cause: value });
+  if ((typeof value === "object" && value !== null) || typeof value === "function") {
+    Object.assign(error, value);
+  }
+  return error;
+}

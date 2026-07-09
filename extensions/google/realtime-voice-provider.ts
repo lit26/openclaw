@@ -1,3 +1,4 @@
+// Google provider module implements model/runtime integration.
 import { randomUUID } from "node:crypto";
 import type {
   ActivityHandling,
@@ -16,6 +17,10 @@ import type {
   ThinkingConfig,
   TurnCoverage,
 } from "@google/genai";
+import {
+  resolveExpiresAtMsFromDurationMs,
+  timestampMsToIsoString,
+} from "openclaw/plugin-sdk/number-runtime";
 import type { OpenClawConfig } from "openclaw/plugin-sdk/provider-onboard";
 import type {
   RealtimeVoiceAudioFormat,
@@ -25,6 +30,7 @@ import type {
   RealtimeVoiceBridgeCreateRequest,
   RealtimeVoiceProviderConfig,
   RealtimeVoiceProviderPlugin,
+  RealtimeVoiceRole,
   RealtimeVoiceTool,
   RealtimeVoiceToolResultOptions,
 } from "openclaw/plugin-sdk/realtime-voice";
@@ -36,6 +42,7 @@ import {
   REALTIME_VOICE_AGENT_CONSULT_TOOL_NAME,
   resamplePcm,
 } from "openclaw/plugin-sdk/realtime-voice";
+import { warn } from "openclaw/plugin-sdk/runtime-env";
 import { normalizeResolvedSecretInputString } from "openclaw/plugin-sdk/secret-input";
 import {
   asBoolean,
@@ -58,6 +65,8 @@ const GOOGLE_REALTIME_BROWSER_NEW_SESSION_TTL_MS = 60 * 1000;
 const GOOGLE_REALTIME_RECONNECT_MAX_ATTEMPTS = 3;
 const GOOGLE_REALTIME_RECONNECT_BASE_DELAY_MS = 250;
 const GOOGLE_REALTIME_RECONNECT_MAX_DELAY_MS = 2_000;
+// Google Live requires a leading letter/underscore and caps function names at 128 characters.
+const GOOGLE_REALTIME_TOOL_NAME_RE = /^[A-Za-z_][A-Za-z0-9_.:-]{0,127}$/;
 const MULAW_LINEAR_SAMPLES = new Int16Array(256);
 
 for (let i = 0; i < MULAW_LINEAR_SAMPLES.length; i += 1) {
@@ -112,6 +121,7 @@ type GoogleRealtimeLiveConfig = {
 };
 
 type GoogleRealtimeVoiceBridgeConfig = RealtimeVoiceBridgeCreateRequest & GoogleRealtimeLiveConfig;
+type GoogleLiveTranscription = NonNullable<LiveServerContent["inputTranscription"]>;
 
 type GoogleLiveSession = {
   sendClientContent: (params: {
@@ -334,17 +344,34 @@ function buildRealtimeInputConfig(
 }
 
 function buildFunctionDeclarations(tools: RealtimeVoiceTool[] | undefined): FunctionDeclaration[] {
-  return (tools ?? []).map((tool) => {
-    const declaration: FunctionDeclaration = {
-      name: tool.name,
-      description: tool.description,
-      parametersJsonSchema: tool.parameters,
-    };
-    if (tool.name === REALTIME_VOICE_AGENT_CONSULT_TOOL_NAME) {
-      declaration.behavior = "NON_BLOCKING" as Behavior;
+  const declarations: FunctionDeclaration[] = [];
+  let omitted = 0;
+  for (const tool of tools ?? []) {
+    try {
+      const name = tool.name;
+      if (typeof name !== "string" || !GOOGLE_REALTIME_TOOL_NAME_RE.test(name)) {
+        omitted += 1;
+        continue;
+      }
+      // Live preview models honor the OpenAPI `parameters` field; the SDK normalizes
+      // our lowercase JSON Schema types before sending the mutually exclusive field.
+      const declaration: FunctionDeclaration = {
+        name,
+        description: tool.description,
+        parameters: tool.parameters as unknown as FunctionDeclaration["parameters"],
+      };
+      if (name === REALTIME_VOICE_AGENT_CONSULT_TOOL_NAME) {
+        declaration.behavior = "NON_BLOCKING" as Behavior;
+      }
+      declarations.push(declaration);
+    } catch {
+      omitted += 1;
     }
-    return declaration;
-  });
+  }
+  if (omitted > 0) {
+    warn(`google realtime: omitted ${omitted} tool definition(s) with unsupported names`);
+  }
+  return declarations;
 }
 
 function buildGoogleLiveConnectConfig(config: GoogleRealtimeLiveConfig): LiveConnectConfig {
@@ -449,19 +476,30 @@ class GoogleRealtimeVoiceBridge implements RealtimeVoiceBridge {
   private resumptionHandle: string | undefined;
   private reconnectAttempts = 0;
   private reconnectTimer: ReturnType<typeof setTimeout> | undefined;
+  private hasConnectedSession = false;
+  private readonly pendingTranscripts: Record<RealtimeVoiceRole, string> = {
+    user: "",
+    assistant: "",
+  };
 
   constructor(private readonly config: GoogleRealtimeVoiceBridgeConfig) {
     this.audioFormat = config.audioFormat ?? REALTIME_VOICE_AUDIO_FORMAT_G711_ULAW_8KHZ;
   }
 
   async connect(): Promise<void> {
+    const canResumeSession =
+      this.config.sessionResumption !== false && Boolean(this.resumptionHandle);
+    if (this.hasConnectedSession && !canResumeSession) {
+      // An unfinished recognition hypothesis cannot cross into a fresh server session.
+      // Dropping it avoids treating a transport break as a completed user utterance.
+      this.resetPendingTranscripts();
+    }
     this.intentionallyClosed = false;
     this.sessionConfigured = false;
     this.sessionReadyFired = false;
     this.consecutiveSilenceMs = 0;
     this.audioStreamEnded = false;
     this.pendingFunctionNames.clear();
-
     const ai = createGoogleGenAI({
       apiKey: this.config.apiKey,
       httpOptions: {
@@ -511,6 +549,9 @@ class GoogleRealtimeVoiceBridge implements RealtimeVoiceBridge {
           if (this.scheduleReconnect(closeDetails)) {
             return;
           }
+          // Transport failure is not an utterance boundary. Preserve transcript
+          // fragments across reconnects and finalize only when recovery is exhausted.
+          this.flushPendingTranscripts();
           this.config.onError?.(
             new Error(`Google Live session closed after reconnect attempts: ${closeDetails}`),
           );
@@ -518,6 +559,7 @@ class GoogleRealtimeVoiceBridge implements RealtimeVoiceBridge {
         },
       },
     })) as GoogleLiveSession;
+    this.hasConnectedSession = true;
   }
 
   sendAudio(audio: Buffer): void {
@@ -648,6 +690,7 @@ class GoogleRealtimeVoiceBridge implements RealtimeVoiceBridge {
     this.consecutiveSilenceMs = 0;
     this.audioStreamEnded = false;
     this.pendingFunctionNames.clear();
+    this.flushPendingTranscripts();
     const session = this.session;
     this.session = null;
     session?.close();
@@ -727,26 +770,19 @@ class GoogleRealtimeVoiceBridge implements RealtimeVoiceBridge {
 
   private handleServerContent(content: LiveServerContent): void {
     if (content.interrupted) {
-      this.config.onClearAudio();
+      this.config.onClearAudio("barge-in");
     }
 
-    if (content.inputTranscription?.text) {
-      this.config.onTranscript?.(
-        "user",
-        content.inputTranscription.text,
-        content.inputTranscription.finished ?? false,
-      );
+    if (content.inputTranscription) {
+      this.appendTranscript("user", content.inputTranscription);
     }
 
-    if (content.outputTranscription?.text) {
-      this.config.onTranscript?.(
-        "assistant",
-        content.outputTranscription.text,
-        content.outputTranscription.finished ?? false,
-      );
+    if (content.outputTranscription) {
+      // outputAudioTranscription is requested in the session config. Keep that
+      // official stream canonical; modelTurn text has no transcript turn identity.
+      this.appendTranscript("assistant", content.outputTranscription);
     }
 
-    let emittedAssistantText = false;
     for (const part of content.modelTurn?.parts ?? []) {
       if (part.inlineData?.data) {
         const pcm = Buffer.from(part.inlineData.data, "base64");
@@ -758,18 +794,52 @@ class GoogleRealtimeVoiceBridge implements RealtimeVoiceBridge {
         }
         continue;
       }
-      if (part.thought) {
-        continue;
-      }
-      if (!content.outputTranscription?.text && typeof part.text === "string" && part.text.trim()) {
-        emittedAssistantText = true;
-        this.config.onTranscript?.("assistant", part.text, content.turnComplete ?? false);
-      }
     }
+  }
 
-    if (!emittedAssistantText && content.turnComplete && content.waitingForInput === false) {
-      return;
+  private appendTranscript(role: RealtimeVoiceRole, transcript: GoogleLiveTranscription): void {
+    const text = transcript.text;
+    if (text) {
+      this.pendingTranscripts[role] += text;
+      this.emitTranscript(role, text, false);
     }
+    // turnComplete belongs to model generation and is unordered with transcription.
+    // Finalize only on the protocol terminal or when the bridge permanently closes.
+    if (transcript.finished) {
+      this.flushPendingTranscript(role);
+    }
+  }
+
+  private flushPendingTranscript(role: RealtimeVoiceRole): void {
+    const completeText = this.pendingTranscripts[role].trim();
+    this.pendingTranscripts[role] = "";
+    if (completeText) {
+      this.emitTranscript(role, completeText, true);
+    }
+  }
+
+  private emitTranscript(role: RealtimeVoiceRole, text: string, isFinal: boolean): void {
+    try {
+      this.config.onTranscript?.(role, text, isFinal);
+    } catch (error) {
+      try {
+        this.config.onError?.(
+          error instanceof Error ? error : new Error("Google Live transcript callback failed"),
+        );
+      } catch {
+        // Consumer callback failures must not abort provider cleanup.
+      }
+    }
+  }
+
+  private flushPendingTranscripts(): void {
+    this.flushPendingTranscript("user");
+    this.flushPendingTranscript("assistant");
+  }
+
+  private resetPendingTranscripts(): void {
+    this.pendingTranscripts.user = "";
+    this.pendingTranscripts.assistant = "";
   }
 
   private handleToolCall(toolCall: LiveServerToolCall): void {
@@ -812,6 +882,7 @@ class GoogleRealtimeVoiceBridge implements RealtimeVoiceBridge {
         const message = error instanceof Error ? error.message : String(error);
         this.config.onError?.(error instanceof Error ? error : new Error(message));
         if (!this.scheduleReconnect(`connect failed: ${message}`)) {
+          this.flushPendingTranscripts();
           this.config.onClose?.("error");
         }
       });
@@ -847,7 +918,14 @@ function decodeMulawSample(value: number): number {
 async function createGoogleRealtimeBrowserSession(
   req: RealtimeVoiceBrowserSessionCreateRequest,
 ): Promise<RealtimeVoiceBrowserSession> {
-  const config = normalizeProviderConfig(req.providerConfig);
+  const providerConfig = normalizeProviderConfig(req.providerConfig);
+  const prefixPaddingMs = asNonNegativeInteger(req.prefixPaddingMs);
+  const silenceDurationMs = asNonNegativeInteger(req.silenceDurationMs);
+  const config = {
+    ...providerConfig,
+    ...(prefixPaddingMs !== undefined ? { prefixPaddingMs } : {}),
+    ...(silenceDurationMs !== undefined ? { silenceDurationMs } : {}),
+  };
   const apiKey = config.apiKey || resolveEnvApiKey();
   if (!apiKey) {
     throw new Error("Google Gemini API key missing");
@@ -855,8 +933,19 @@ async function createGoogleRealtimeBrowserSession(
 
   const model = req.model ?? config.model ?? GOOGLE_REALTIME_DEFAULT_MODEL;
   const voice = req.voice ?? config.voice ?? GOOGLE_REALTIME_DEFAULT_VOICE;
-  const expiresAtMs = Date.now() + GOOGLE_REALTIME_BROWSER_SESSION_TTL_MS;
-  const newSessionExpiresAtMs = Date.now() + GOOGLE_REALTIME_BROWSER_NEW_SESSION_TTL_MS;
+  const nowMs = Date.now();
+  const expiresAtMs = resolveExpiresAtMsFromDurationMs(GOOGLE_REALTIME_BROWSER_SESSION_TTL_MS, {
+    nowMs,
+  });
+  const newSessionExpiresAtMs = resolveExpiresAtMsFromDurationMs(
+    GOOGLE_REALTIME_BROWSER_NEW_SESSION_TTL_MS,
+    { nowMs },
+  );
+  const expireTime = timestampMsToIsoString(expiresAtMs);
+  const newSessionExpireTime = timestampMsToIsoString(newSessionExpiresAtMs);
+  if (expiresAtMs === undefined || !expireTime || !newSessionExpireTime) {
+    throw new Error("Google realtime browser session expiry is outside the supported Date range");
+  }
   const ai = createGoogleGenAI({
     apiKey,
     httpOptions: {
@@ -866,8 +955,8 @@ async function createGoogleRealtimeBrowserSession(
   const token = await ai.authTokens.create({
     config: {
       uses: 1,
-      expireTime: new Date(expiresAtMs).toISOString(),
-      newSessionExpireTime: new Date(newSessionExpiresAtMs).toISOString(),
+      expireTime,
+      newSessionExpireTime,
       liveConnectConstraints: {
         model,
         config: buildGoogleLiveConnectConfig({
@@ -923,6 +1012,7 @@ export function buildGoogleRealtimeVoiceProvider(): RealtimeVoiceProviderPlugin 
       ],
       supportsBrowserSession: true,
       supportsBargeIn: true,
+      handlesInputAudioBargeIn: true,
       supportsToolCalls: true,
       supportsVideoFrames: true,
       supportsSessionResumption: true,

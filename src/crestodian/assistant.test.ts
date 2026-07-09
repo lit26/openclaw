@@ -1,3 +1,4 @@
+// Crestodian assistant tests cover assistant-driven rescue message generation.
 import { describe, expect, it, vi } from "vitest";
 import type { RunCliAgentParams } from "../agents/cli-runner/types.js";
 import type { RunEmbeddedAgentParams } from "../agents/embedded-agent-runner/run/params.js";
@@ -24,6 +25,7 @@ function overview(overrides: Partial<CrestodianOverview["tools"]> = {}): Crestod
     tools: {
       codex: { command: "codex", found: false },
       claude: { command: "claude", found: false },
+      gemini: { command: "gemini", found: false },
       apiKeys: { openai: false, anthropic: false },
       ...overrides,
     },
@@ -66,9 +68,14 @@ describe("Crestodian assistant", () => {
     });
   });
 
-  it("rejects non-command output", () => {
+  it("rejects non-JSON and empty plans but accepts chat-only replies", () => {
     expect(parseCrestodianAssistantPlanText("I would edit config directly.")).toBeNull();
-    expect(parseCrestodianAssistantPlanText('{"reply":"missing command"}')).toBeNull();
+    expect(parseCrestodianAssistantPlanText("{}")).toBeNull();
+    // Conversational turns without a command are valid: the custodian can
+    // answer questions without proposing an operation.
+    expect(parseCrestodianAssistantPlanText('{"reply":"just chatting"}')).toEqual({
+      reply: "just chatting",
+    });
   });
 
   it("includes only operational summary context in planner prompts", () => {
@@ -166,6 +173,17 @@ describe("Crestodian assistant", () => {
         }),
       ).map((backend) => backend.kind),
     ).toEqual(["claude-cli", "codex-app-server"]);
+
+    // Setup-ladder order: Claude Code, Codex, Gemini.
+    expect(
+      selectCrestodianLocalPlannerBackends(
+        overview({
+          claude: { command: "claude", found: true },
+          codex: { command: "codex", found: true },
+          gemini: { command: "gemini", found: true },
+        }),
+      ).map((backend) => backend.kind),
+    ).toEqual(["claude-cli", "codex-app-server", "gemini-cli"]);
 
     const [codexAppServer] = selectCrestodianLocalPlannerBackends(
       overview({

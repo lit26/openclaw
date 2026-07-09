@@ -1,4 +1,9 @@
+/**
+ * Node-host browser.proxy command implementation for delegated Browser control
+ * requests.
+ */
 import fsPromises from "node:fs/promises";
+import { resolveTimerTimeoutMs } from "openclaw/plugin-sdk/number-runtime";
 import { normalizeStringEntries } from "openclaw/plugin-sdk/string-coerce-runtime";
 import { redactCdpUrl } from "../browser/cdp.helpers.js";
 import { loadBrowserConfigForRuntimeRefresh } from "../browser/config-refresh-source.js";
@@ -56,6 +61,7 @@ let browserControlReady: Promise<void> | null = null;
 
 // Keep the production singleton but give tests a cheap reset seam so they do
 // not need to reload the entire module graph between cases.
+/** Resets the cached Browser control startup promise for tests. */
 export function resetBrowserProxyCommandStateForTests(): void {
   browserControlReady = null;
 }
@@ -136,9 +142,7 @@ function decodeParams<T>(raw?: string | null): T {
 }
 
 function resolveBrowserProxyTimeout(timeoutMs?: number): number {
-  return typeof timeoutMs === "number" && Number.isFinite(timeoutMs)
-    ? Math.max(1, Math.floor(timeoutMs))
-    : DEFAULT_BROWSER_PROXY_TIMEOUT_MS;
+  return resolveTimerTimeoutMs(timeoutMs, DEFAULT_BROWSER_PROXY_TIMEOUT_MS);
 }
 
 function isBrowserProxyTimeoutError(err: unknown): boolean {
@@ -148,10 +152,12 @@ function isBrowserProxyTimeoutError(err: unknown): boolean {
 function isWsBackedBrowserProxyPath(path: string): boolean {
   return (
     path === "/act" ||
+    path === "/download" ||
     path === "/navigate" ||
     path === "/pdf" ||
     path === "/screenshot" ||
-    path === "/snapshot"
+    path === "/snapshot" ||
+    path === "/wait/download"
   );
 }
 
@@ -220,6 +226,7 @@ function formatBrowserProxyTimeoutMessage(params: {
   return parts.join("; ");
 }
 
+/** Executes a serialized browser.proxy command and returns a serialized result payload. */
 export async function runBrowserProxyCommand(paramsJSON?: string | null): Promise<string> {
   const params = decodeParams<BrowserProxyParams>(paramsJSON);
   const pathValue = typeof params.path === "string" ? params.path.trim() : "";
@@ -310,11 +317,13 @@ export async function runBrowserProxyCommand(paramsJSON?: string | null): Promis
     );
   }
   if (response.status >= 400) {
-    const message =
+    // node.invoke preserves only Error.message; keep the status there so gateway
+    // retry classifiers see the same error shape as direct browser requests.
+    const detail =
       response.body && typeof response.body === "object" && "error" in response.body
-        ? String((response.body as { error?: unknown }).error)
-        : `HTTP ${response.status}`;
-    throw new Error(message);
+        ? String((response.body as { error?: unknown }).error).trim()
+        : "";
+    throw new Error(detail ? `${response.status}: ${detail}` : `HTTP ${response.status}`);
   }
 
   const result = response.body;

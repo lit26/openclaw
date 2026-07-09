@@ -1,3 +1,4 @@
+// Mattermost plugin module implements target resolution behavior.
 import { isPrivateNetworkOptInEnabled } from "openclaw/plugin-sdk/ssrf-runtime";
 import { normalizeOptionalString } from "openclaw/plugin-sdk/string-coerce-runtime";
 import { resolveMattermostAccount } from "./accounts.js";
@@ -8,7 +9,7 @@ import {
 } from "./client.js";
 import type { OpenClawConfig } from "./runtime-api.js";
 
-export type MattermostOpaqueTargetResolution = {
+type MattermostOpaqueTargetResolution = {
   kind: "user" | "channel";
   id: string;
   to: string;

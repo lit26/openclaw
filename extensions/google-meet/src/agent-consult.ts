@@ -1,3 +1,4 @@
+// Google Meet plugin module implements agent consult behavior.
 import type { OpenClawConfig } from "openclaw/plugin-sdk/config-contracts";
 import { formatErrorMessage } from "openclaw/plugin-sdk/error-runtime";
 import type { PluginRuntime, RuntimeLogger } from "openclaw/plugin-sdk/plugin-runtime";
@@ -16,8 +17,6 @@ import { normalizeAgentId } from "openclaw/plugin-sdk/routing";
 import { normalizeOptionalString } from "openclaw/plugin-sdk/string-coerce-runtime";
 import type { GoogleMeetConfig, GoogleMeetToolPolicy } from "./config.js";
 
-export const GOOGLE_MEET_AGENT_CONSULT_TOOL_NAME = REALTIME_VOICE_AGENT_CONSULT_TOOL_NAME;
-
 const GOOGLE_MEET_CONSULT_SYSTEM_PROMPT = [
   "You are a behind-the-scenes consultant for a live meeting voice agent.",
   "Prioritize a fast, speakable answer over exhaustive investigation.",
@@ -30,7 +29,7 @@ export function resolveGoogleMeetRealtimeTools(policy: GoogleMeetToolPolicy): Re
   return resolveRealtimeVoiceAgentConsultTools(policy);
 }
 
-export function submitGoogleMeetConsultWorkingResponse(
+function submitGoogleMeetConsultWorkingResponse(
   session: RealtimeVoiceBridgeSession,
   callId: string,
 ): void {
@@ -107,7 +106,7 @@ export function handleGoogleMeetRealtimeConsultToolCall(params: {
     });
     return;
   }
-  if (params.event.name !== GOOGLE_MEET_AGENT_CONSULT_TOOL_NAME) {
+  if (params.event.name !== REALTIME_VOICE_AGENT_CONSULT_TOOL_NAME) {
     params.onTalkEvent?.({
       type: "tool.error",
       callId,
@@ -144,7 +143,7 @@ export function handleGoogleMeetRealtimeConsultToolCall(params: {
       });
       params.session.submitToolResult(callId, result);
     })
-    .catch((error: Error) => {
+    .catch((error: unknown) => {
       params.onTalkEvent?.({
         type: "tool.error",
         callId,
