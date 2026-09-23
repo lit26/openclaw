@@ -42,7 +42,7 @@ Standard (`stepfun`):
 
 | Model ref                | Context   | Max output | Notes                              |
 | ------------------------ | --------- | ---------- | ---------------------------------- |
-| `stepfun/step-5-preview` | 1,048,576 | 1,048,576  | Default standard model, 1M context |
+| `stepfun/step-5-preview` | 1,048,576 | 65,536     | Default standard model, 1M context |
 | `stepfun/step-3.7-flash` | 262,144   | 262,144    | Multimodal image input support     |
 | `stepfun/step-3.5-flash` | 262,144   | 65,536     | Text-only reasoning model          |
 
@@ -50,7 +50,7 @@ Step Plan (`stepfun-plan`):
 
 | Model ref                          | Context   | Max output | Notes                               |
 | ---------------------------------- | --------- | ---------- | ----------------------------------- |
-| `stepfun-plan/step-5-preview`      | 1,048,576 | 1,048,576  | Default Step Plan model, 1M context |
+| `stepfun-plan/step-5-preview`      | 1,048,576 | 65,536     | Default Step Plan model, 1M context |
 | `stepfun-plan/step-3.7-flash`      | 262,144   | 262,144    | Multimodal image input support      |
 | `stepfun-plan/step-3.5-flash`      | 262,144   | 65,536     | Text-only reasoning model           |
 | `stepfun-plan/step-3.5-flash-2603` | 262,144   | 65,536     | Additional Step Plan model          |
@@ -165,7 +165,7 @@ A single auth flow writes region-matched profiles for both `stepfun` and `stepfu
                 thinkingLevelMap: { off: "low", minimal: "low", xhigh: "high", max: "high" },
                 cost: { input: 1, output: 2.86, cacheRead: 0.05, cacheWrite: 0 },
                 contextWindow: 1048576,
-                maxTokens: 1048576,
+                maxTokens: 65536,
               },
               {
                 id: "step-3.7-flash",
@@ -215,7 +215,7 @@ A single auth flow writes region-matched profiles for both `stepfun` and `stepfu
                 thinkingLevelMap: { off: "low", minimal: "low", xhigh: "high", max: "high" },
                 cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
                 contextWindow: 1048576,
-                maxTokens: 1048576,
+                maxTokens: 65536,
               },
               {
                 id: "step-3.7-flash",

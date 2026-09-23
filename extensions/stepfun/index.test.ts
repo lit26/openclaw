@@ -56,7 +56,7 @@ describe("stepfun provider registration", () => {
       input: ["text", "image"],
       thinkingLevelMap: { off: "low", minimal: "low", xhigh: "high", max: "high" },
       contextWindow: 1048576,
-      maxTokens: 1048576,
+      maxTokens: 65536,
       cost: { input: 1, output: 2.86, cacheRead: 0.05, cacheWrite: 0 },
       compat: {
         supportsReasoningEffort: true,
@@ -66,7 +66,7 @@ describe("stepfun provider registration", () => {
     });
     expect(planStep5).toMatchObject({
       contextWindow: 1048576,
-      maxTokens: 1048576,
+      maxTokens: 65536,
       cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
     });
     const standard35 = standard.models?.find((model) => model.id === "step-3.5-flash");

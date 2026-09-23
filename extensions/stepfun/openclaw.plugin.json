@@ -42,7 +42,7 @@
               "max": "high"
             },
             "contextWindow": 1048576,
-            "maxTokens": 1048576,
+            "maxTokens": 65536,
             "cost": {
               "input": 1,
               "output": 2.86,
@@ -142,7 +142,7 @@
               "max": "high"
             },
             "contextWindow": 1048576,
-            "maxTokens": 1048576,
+            "maxTokens": 65536,
             "cost": {
               "input": 0,
               "output": 0,
