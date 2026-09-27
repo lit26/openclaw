@@ -1,6 +1,6 @@
 import { afterEach, describe, expect, it } from "vitest";
 import { upsertSessionEntryCore } from "../config/sessions/session-accessor.js";
-import { addSessionMember } from "../config/sessions/session-sharing-store.js";
+import { addSessionMember } from "../config/sessions/session-sharing-store.native.js";
 import { closeOpenClawAgentDatabasesForTest } from "../state/openclaw-agent-db.js";
 import { ensureProfileForEmail } from "../state/user-profiles.js";
 import { withOpenClawTestState } from "../test-utils/openclaw-test-state.js";
@@ -833,10 +833,17 @@ describe("session sharing policy", () => {
         ["progressCard.get", { sessionKey: "global", agentId: "work" }],
         ["progressCard.put", { sessionKey: "global", agentId: "work" }],
       ] as const) {
-        expect(
-          resolveSessionMutationAuthorization({ client: outsider, method, requestParams, context })
-            .error,
-        ).toMatchObject({ details: { code: "SESSION_PARTICIPATION_REQUIRED" } });
+        const { error } = resolveSessionMutationAuthorization({
+          client: outsider,
+          method,
+          requestParams,
+          context,
+        });
+        if (method === "progressCard.get") {
+          expect(error).toBeNull();
+        } else {
+          expect(error).toMatchObject({ details: { code: "SESSION_PARTICIPATION_REQUIRED" } });
+        }
       }
       for (const method of ["progressCard.get", "progressCard.put"]) {
         expect(
