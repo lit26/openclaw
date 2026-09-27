@@ -163,7 +163,7 @@ A single auth flow writes region-matched profiles for both `stepfun` and `stepfu
                 reasoning: true,
                 input: ["text", "image"],
                 thinkingLevelMap: { off: "low", minimal: "low", xhigh: "high", max: "high" },
-                cost: { input: 1, output: 2.86, cacheRead: 0.05, cacheWrite: 0 },
+                cost: { input: 1, output: 2.7, cacheRead: 0.05, cacheWrite: 0 },
                 contextWindow: 1048576,
                 maxTokens: 65536,
               },
