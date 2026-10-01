@@ -1,6 +1,5 @@
-// Stepfun setup module handles plugin onboarding behavior.
 import {
-  createModelCatalogPresetAppliers,
+  createProviderConnectionPresetAppliers,
   type ModelProviderConfig,
   type OpenClawConfig,
   type ProviderOnboardPresetAppliers,
@@ -25,9 +24,9 @@ function createStepFunPresetAppliers(params: {
   alias: string;
   buildProvider: (baseUrl: string) => ModelProviderConfig;
 }): ProviderOnboardPresetAppliers<[string]> {
-  return createModelCatalogPresetAppliers<[string]>({
+  return createProviderConnectionPresetAppliers<[string]>({
     primaryModelRef: params.primaryModelRef,
-    resolveParams: (cfg: OpenClawConfig, baseUrl: string) => {
+    resolveParams: (cfg, baseUrl) => {
       const provider = params.buildProvider(baseUrl);
       const models = provider.models ?? [];
       // A prior onboarding run bound the shared alias (e.g. "StepFun") to the
@@ -49,7 +48,7 @@ function createStepFunPresetAppliers(params: {
         providerId: params.providerId,
         api: provider.api ?? "openai-completions",
         baseUrl,
-        catalogModels: cfg.models?.mode === "replace" ? models : [],
+        catalogModels: provider.models,
         aliases: [
           ...models.map((model) => `${params.providerId}/${model.id}`),
           ...(aliasOwnedByOtherModel

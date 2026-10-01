@@ -109,10 +109,8 @@ export async function startGatewayCoreRuntime(input: {
     sessionEventSubscribers,
     toolEventRecipients,
     broadcastToConnIds,
-    terminalSessions,
     controlUiBasePath,
     workerEnvironmentService,
-    workerPlacementDispatchAvailable,
     workerPlacementControlAvailable,
     desktopSessionRegistry,
     gatewayComputerService,
@@ -210,11 +208,6 @@ export async function startGatewayCoreRuntime(input: {
             ) => {
               void nodeSendToSession(sessionKey, event, payload, opts);
             },
-            skillsRefreshDelayMs: runtimeState.skillsRefreshDelayMs,
-            getSkillsRefreshTimer: () => runtimeState.skillsRefreshTimer,
-            setSkillsRefreshTimer: (timer) => {
-              runtimeState.skillsRefreshTimer = timer;
-            },
             getRuntimeConfig,
             startupTrace,
           }),
@@ -262,7 +255,6 @@ export async function startGatewayCoreRuntime(input: {
       sessionMessageSubscribers,
       chatAbortControllers,
       restartRecoveryCandidates,
-      terminalSessions,
       refreshConnectedUserProfiles: () =>
         runtime.resolvePluginGatewayContext()?.refreshConnectedUserProfile?.(),
     }),
@@ -419,7 +411,7 @@ export async function startGatewayCoreRuntime(input: {
           (descriptor.name !== "environments.create" &&
             descriptor.name !== "environments.destroy" &&
             !descriptor.name.startsWith("environments.session."))) &&
-        (workerPlacementDispatchAvailable || descriptor.name !== "sessions.dispatch") &&
+        (workerPlacementControlAvailable || descriptor.name !== "sessions.dispatch") &&
         (workerPlacementControlAvailable ||
           (descriptor.name !== "sessions.reclaim" && descriptor.name !== "sessions.move")) &&
         (workerEnvironmentService ||

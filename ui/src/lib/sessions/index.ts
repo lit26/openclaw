@@ -123,6 +123,7 @@ export function createSessionCapability(
   const listeners = new Set<(next: SessionState) => void>();
   const createdListeners = new Set<(key: string) => void>();
   const thinkingClaims = createSessionThinkingClaims(gateway, () => roster.requestRevision);
+  let publicationRevision = 0;
   let canonicalListRevision = 0;
   let hydratedClient: SessionGateway["snapshot"]["client"] = null;
   let hydratedSelfUserId: string | null = null;
@@ -131,6 +132,7 @@ export function createSessionCapability(
   let publishedErrorSource: "session-observer" | "operation" | null = null;
 
   const notifySubscribers = () => {
+    publicationRevision += 1;
     for (const listener of listeners) {
       listener(state);
     }
@@ -200,12 +202,16 @@ export function createSessionCapability(
       sessionEventSubscriptionError = error;
       if (error !== null) {
         roster.retireWarmLists();
+        roster.observations.descriptions.clear();
       }
       const observerOwnsVisibleError = publishedErrorSource === "session-observer";
       if (error !== null && (state.error === null || observerOwnsVisibleError)) {
         publish({ ...state, error }, "session-observer");
       } else if (error === null && observerOwnsVisibleError) {
         publish({ ...state, error: null });
+      } else if (previousError !== error) {
+        // Query and operation errors must not hide observer transitions from other views.
+        notifySubscribers();
       }
       if (previousError !== null && error === null) {
         // Observer outages do not replay events; every held query must close the gap.
@@ -296,6 +302,7 @@ export function createSessionCapability(
     // A local mutation can complete without an event or successful refresh.
     // Retire inactive windows before exposing its publication to selection.
     roster.retireWarmLists();
+    roster.observations.descriptions.clear();
     publish(next, errorSource);
   };
 
@@ -450,6 +457,7 @@ export function createSessionCapability(
         deletions.clear();
       }
       const hadPullRequestSummaries = pullRequestSummaries.size > 0;
+      const hadSubscriptionError = sessionEventSubscriptionError !== null;
       thinkingClaims.reset();
       permissions.clear();
       roster.reset();
@@ -462,7 +470,7 @@ export function createSessionCapability(
       pullRequestSummaries.clear();
       pullRequestEpochs.clear();
       // Client replacement needs a publish; disconnect publishes cleared state below.
-      if (hadPullRequestSummaries && connected && next.client) {
+      if ((hadPullRequestSummaries || hadSubscriptionError) && connected && next.client) {
         publish({ ...state });
       }
     }
@@ -525,6 +533,9 @@ export function createSessionCapability(
   });
 
   const stopEvents = gateway.subscribeEvents((event) => {
+    if (event.event === "config.changed" || event.event === "chat.metadata.changed") {
+      roster.observations.descriptions.clear();
+    }
     if (event.event === "config.changed") {
       // Config can change configured-agent membership even with no chat pane mounted.
       roster.scheduleEvent();
@@ -533,6 +544,7 @@ export function createSessionCapability(
     if (event.event !== "sessions.changed" && event.event !== "session.message") {
       return;
     }
+    roster.observations.descriptions.invalidateEvent(event.payload);
     const payload = event.payload as {
       agentId?: unknown;
       reason?: unknown;
@@ -603,8 +615,14 @@ export function createSessionCapability(
   });
 
   return {
+    get revision() {
+      return publicationRevision;
+    },
     get state() {
       return state;
+    },
+    get eventSubscriptionError() {
+      return sessionEventSubscriptionError;
     },
     get presentation() {
       return presentation.result
@@ -618,6 +636,7 @@ export function createSessionCapability(
     whenCachedRosterSettled: () => cacheLifecycle.settled,
     captureConnectionScope: connection.capture,
     isConnectionScopeCurrent: connection.isCurrent,
+    describe: roster.observations.descriptions.describe,
     list: roster.list,
     observeList: roster.observeList,
     listSnapshot: roster.listSnapshot,

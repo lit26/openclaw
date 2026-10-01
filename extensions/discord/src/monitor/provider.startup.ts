@@ -192,14 +192,9 @@ export async function fetchDiscordBotIdentity(params: {
     throw new Error("Failed to resolve Discord bot identity", { cause: err });
   }
 
-  const botUserRecord = botUser as
-    | { id?: unknown; username?: unknown; globalName?: unknown }
-    | null
-    | undefined;
-  const botUserId = normalizeOptionalString(botUserRecord?.id);
+  const botUserId = normalizeOptionalString(botUser?.id);
   const botUserName =
-    normalizeOptionalString(botUserRecord?.username) ??
-    normalizeOptionalString(botUserRecord?.globalName);
+    normalizeOptionalString(botUser?.username) ?? normalizeOptionalString(botUser?.globalName);
   if (!botUserId) {
     const details = 'fetchUser("@me") returned no usable id';
     params.runtime.error?.(danger(`discord: failed to fetch bot identity: ${details}`));
@@ -233,14 +228,12 @@ export function registerDiscordMonitorListeners(params: {
   messageHandler: ConstructorParameters<typeof DiscordMessageListener>[0];
   trackInboundEvent?: () => void;
 }) {
-  registerDiscordListener(
-    params.client.listeners,
+  for (const listener of [
     new DiscordInteractionListener(params.logger, params.trackInboundEvent),
-  );
-  registerDiscordListener(
-    params.client.listeners,
     new DiscordMessageListener(params.messageHandler, params.logger, params.trackInboundEvent),
-  );
+  ]) {
+    registerDiscordListener(params.client.listeners, listener);
+  }
   const guildJoinListener = new DiscordGuildJoinIntroductionListener({
     readPolicy: params.readPolicy,
     cfg: params.cfg,
@@ -269,24 +262,20 @@ export function registerDiscordMonitorListeners(params: {
     logger: params.logger,
     onEvent: params.trackInboundEvent,
   };
-  registerDiscordListener(
-    params.client.listeners,
+  for (const listener of [
     new DiscordReactionListener(reactionListenerOptions),
-  );
-  registerDiscordListener(
-    params.client.listeners,
     new DiscordReactionRemoveListener(reactionListenerOptions),
-  );
+  ]) {
+    registerDiscordListener(params.client.listeners, listener);
+  }
   const threadUpdateListener = new DiscordThreadUpdateListener(params.cfg, params.logger);
-  registerDiscordListener(params.client.listeners, threadUpdateListener);
-  registerDiscordListener(
-    params.client.listeners,
+  for (const listener of [
+    threadUpdateListener,
     new DiscordThreadReadyListener(threadUpdateListener),
-  );
-  registerDiscordListener(
-    params.client.listeners,
     new DiscordThreadDeleteListener(params.cfg, params.accountId, params.logger),
-  );
+  ]) {
+    registerDiscordListener(params.client.listeners, listener);
+  }
 
   let presenceListener: DiscordPresenceListener | undefined;
   if (params.discordConfig.intents?.presence) {
@@ -298,19 +287,14 @@ export function registerDiscordMonitorListeners(params: {
       botUserId: params.botUserId,
       guildEntries: params.guildEntries,
     });
-    registerDiscordListener(params.client.listeners, presenceListener);
-    registerDiscordListener(
-      params.client.listeners,
+    for (const listener of [
+      presenceListener,
       new DiscordPresenceGuildCreateListener(presenceListener),
-    );
-    registerDiscordListener(
-      params.client.listeners,
       new DiscordPresenceGuildDeleteListener(presenceListener),
-    );
-    registerDiscordListener(
-      params.client.listeners,
       new DiscordPresenceReadyListener(presenceListener),
-    );
+    ]) {
+      registerDiscordListener(params.client.listeners, listener);
+    }
     params.runtime.log?.("discord: GuildPresences intent enabled — presence listener registered");
   }
   return async () => {

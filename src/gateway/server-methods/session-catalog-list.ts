@@ -6,6 +6,7 @@ import {
   type SessionCatalog,
   validateSessionsCatalogListParams,
 } from "../../../packages/gateway-protocol/src/index.js";
+import { prepareShellPathFromLoginShell } from "../../infra/shell-env.js";
 import {
   capturePluginLifecycleAuthority,
   capturePluginRegistryLifecycleEpoch,
@@ -48,13 +49,6 @@ import type { GatewayRequestHandlers } from "./types.js";
 import { assertValidParams } from "./validation.js";
 
 const SESSION_CATALOG_SEARCH_MAX_UTF16_UNITS = 500;
-
-function normalizeSessionCatalogSearch(search: string | undefined): string | undefined {
-  const normalized = normalizeOptionalString(search);
-  return normalized
-    ? truncateUtf16Safe(normalized, SESSION_CATALOG_SEARCH_MAX_UTF16_UNITS)
-    : undefined;
-}
 
 type CatalogListResult = { catalogs: SessionCatalog[] };
 
@@ -151,7 +145,10 @@ export const listSessionCatalogHandler: GatewayRequestHandlers["sessions.catalog
   if (!resolvedAgent) {
     return;
   }
-  const search = normalizeSessionCatalogSearch(request.search);
+  const searchInput = normalizeOptionalString(request.search);
+  const search = searchInput
+    ? truncateUtf16Safe(searchInput, SESSION_CATALOG_SEARCH_MAX_UTF16_UNITS)
+    : undefined;
   const allowHomeFallback = allowProcessHomeFallback(context.logGateway);
   // Shared provider enumeration is not permission. Each synchronous delivery gets current
   // caller facts and one canonical index, never the provider's pre-await planning snapshot.
@@ -330,6 +327,11 @@ export const listSessionCatalogHandler: GatewayRequestHandlers["sessions.catalog
     const finishProvider = diagnostics?.startWait("provider");
     let catalogList: SessionCatalog[];
     try {
+      if (selected.length > 0) {
+        // Plugin availability callbacks retain synchronous executable resolution contracts.
+        await prepareShellPathFromLoginShell({ env: process.env });
+        progress.assertCurrent();
+      }
       catalogList = await Promise.all(
         selected.map(async (provider): Promise<SessionCatalog> => {
           const shareRoute = catalogRegistrations.shareRoutes.get(provider);
