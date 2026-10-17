@@ -1,3 +1,5 @@
+import fs from "node:fs/promises";
+import path from "node:path";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { createWizardPrompter } from "../../test/helpers/wizard-prompter.js";
 import {
@@ -7,8 +9,11 @@ import {
 import { createTestConfigFileStore } from "../commands/test-runtime-config-helpers.js";
 import type { ConfigWriteOptions } from "../config/io.js";
 import { resolvePersistCandidateForWrite } from "../config/io.write-prepare.js";
-import { migratePersistedImplicitMainRoster } from "../config/legacy.roster.js";
+import type { OpenClawConfigWithLegacyRoster } from "../config/legacy.roster.js";
+import { ConfigMutationConflictError } from "../config/mutation-conflict.js";
 import type { ConfigFileSnapshot, OpenClawConfig } from "../config/types.openclaw.js";
+import { createCanonicalAgentConfigFixture } from "../test-utils/config-roster.js";
+import { withOpenClawTestState } from "../test-utils/openclaw-test-state.js";
 import { WizardCancelledError, type WizardPrompter } from "./prompts.js";
 import { runSetupModelAuthStep, type SetupModelAuthCandidate } from "./setup.model-auth.js";
 import {
@@ -96,7 +101,6 @@ function createDefaultAgentConfig(): OpenClawConfig {
       defaults: { workspace: "/tmp/global-workspace" },
       entries: {
         ops: {
-          default: true,
           agentDir: "/tmp/ops-agent",
           workspace: "/tmp/ops-workspace",
         },
@@ -114,10 +118,11 @@ describe("runSetupModelAuthStep", () => {
   });
 
   it("keeps the migrated setup owner and pending credentials through config copies", async () => {
-    let config = createDefaultAgentConfig();
+    const raw: OpenClawConfigWithLegacyRoster = createDefaultAgentConfig();
+    raw.agents!.entries = { alpha: {}, ...raw.agents!.entries };
+    raw.agents!.entries!.ops!.default = true;
+    let config = createCanonicalAgentConfigFixture(raw).config;
     const prompter = createWizardPrompter();
-    config.agents!.entries = { alpha: {}, ...config.agents!.entries };
-    config = migratePersistedImplicitMainRoster(config).config as OpenClawConfig;
     config = await requireRiskAcknowledgement({ config, opts: { acceptRisk: true }, prompter });
     vi.mocked(prompter.select).mockResolvedValueOnce(false);
     config = await requestTelemetryConsent({ config, opts: {}, prompter });
@@ -351,6 +356,56 @@ describe("runSetupModelAuthStep", () => {
     applyAuthChoice.mockRejectedValueOnce(new WizardCancelledError());
     await expect(runStep()).rejects.toThrow(WizardCancelledError);
   });
+
+  it.each([
+    { source: "root", phase: "chooser" },
+    { source: "include", phase: "chooser" },
+    { source: "root", phase: "preparation" },
+    { source: "include", phase: "preparation" },
+  ])(
+    "revokes prepared provider requests when the $source config changes during $phase",
+    async ({ source, phase }) => {
+      await withOpenClawTestState({ label: "setup-auth-authority" }, async (state) => {
+        const config: OpenClawConfig = { gateway: { port: 19489 } };
+        const includePath = path.join(state.stateDir, "provider.json");
+        await fs.writeFile(includePath, JSON.stringify(config));
+        await fs.writeFile(
+          state.configPath,
+          JSON.stringify(source === "include" ? { $include: "provider.json" } : config),
+        );
+        const replaceConfig = async () => {
+          await fs.writeFile(
+            source === "include" ? includePath : state.configPath,
+            JSON.stringify({ gateway: { port: 19490 } }),
+          );
+        };
+        promptAuthChoiceGrouped
+          .mockReset()
+          .mockImplementationOnce(async () => {
+            if (phase === "chooser") {
+              await replaceConfig();
+            }
+            return "anthropic-cli";
+          })
+          .mockResolvedValueOnce("skip");
+        const sendCredentialRequest = vi.fn();
+        applyAuthChoice.mockReset().mockImplementationOnce(async ({ assertCurrent }) => {
+          if (phase === "preparation") {
+            await replaceConfig();
+          }
+          assertCurrent?.();
+          sendCredentialRequest();
+          return candidate(config);
+        });
+
+        await expect(runStep({ config, stateDir: state.stateDir })).rejects.toBeInstanceOf(
+          ConfigMutationConflictError,
+        );
+        expect(sendCredentialRequest).not.toHaveBeenCalled();
+        expect(promptAuthChoiceGrouped).toHaveBeenCalledTimes(1);
+      });
+    },
+  );
 });
 
 const configFiles = createTestConfigFileStore();
@@ -389,6 +444,17 @@ describe("resolveQuickstartGatewayDefaults", () => {
       tailscale: { mode: "serve" },
     },
   };
+
+  it.each([
+    { credentials: {}, mode: "token" },
+    { credentials: { token: "stored-token" }, mode: "token" },
+    { credentials: { password: "stored-password" }, mode: "password" },
+  ])("retains existing no-auth credential inference: $mode", ({ credentials, mode }) => {
+    expect(
+      resolveQuickstartGatewayDefaults({ gateway: { auth: { mode: "none", ...credentials } } })
+        .authMode,
+    ).toBe(mode);
+  });
 
   it("aligns credential-only overrides while keeping an explicit auth mode authoritative", () => {
     const mode = (

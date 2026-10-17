@@ -34,6 +34,12 @@ const mocks = vi.hoisted(() => ({
   resolveStatusSummaryFromOverview: vi.fn(async () => ({})),
 }));
 
+// mock-isolation: Database inspection is covered at its owner, not by unrelated local diagnostics.
+vi.mock("../status-database-engines.js", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("../status-database-engines.js")>()),
+  resolveStatusDatabaseEngines: async () => ({ source: "admitted", stores: [] }),
+}));
+
 vi.mock("../../agents/exec-defaults.js", () => ({
   resolveNodeExecEligibility: mocks.resolveNodeExecEligibility,
 }));
@@ -134,6 +140,7 @@ describe("buildStatusAllReportData", () => {
     "different-run",
     "same-prose",
     "generic-sentinel",
+    "failed-healthy",
   ] as const)(
     "keeps current update availability alongside %s history without observing config",
     async (history) => {
@@ -170,6 +177,10 @@ describe("buildStatusAllReportData", () => {
         "generic-sentinel",
       ].includes(history);
       if (hasRun) {
+        if (history === "failed-healthy") {
+          completed.status = "failed";
+          completed.reason = "post-update-failed";
+        }
         mocks.history.mockResolvedValue({ lastRun: completed });
         mocks.getUpdateRun.mockReturnValue(completed);
       }
@@ -215,9 +226,13 @@ describe("buildStatusAllReportData", () => {
           gatewaySnapshot: {
             ...baseStatusGatewaySnapshot,
             gatewayReachable: false,
-            gatewayProbe: null,
+            gatewayProbe:
+              history === "failed-healthy"
+                ? { server: { version: "2026.9.2", buildId: "fixture-build" } }
+                : null,
             gatewayCallOverrides: undefined,
             remoteUrlMissing: false,
+            localGatewayHealthy: history === "failed-healthy",
           },
           secretDiagnostics: [],
           tailscaleMode: "off",
@@ -246,7 +261,11 @@ describe("buildStatusAllReportData", () => {
               {
                 Item: "Update run",
                 Value:
-                  history === "active" ? "⬆️ OpenClaw update in progress: verifying." : success,
+                  history === "active"
+                    ? "⬆️ OpenClaw update in progress: verifying."
+                    : history === "failed-healthy"
+                      ? "Last update run failed (post-update-failed) — Gateway is serving 2026.9.2; run `openclaw update` to clear the record."
+                      : success,
               },
             ]
           : []),

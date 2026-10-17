@@ -8,8 +8,8 @@ title: "StepFun"
 
 StepFun ships as an external official plugin (`@openclaw/stepfun-provider`) with two provider ids:
 
-- `stepfun` for the standard endpoint
-- `stepfun-plan` for the Step Plan endpoint
+- `stepfun` for the standard endpoint (models.dev alias: `stepfun-ai`)
+- `stepfun-plan` for the Step Plan endpoint (models.dev alias: `stepfun-ai-step-plan`)
 
 <Warning>
 Standard and Step Plan are **separate providers** with different endpoints and model ref prefixes (`stepfun/...` vs `stepfun-plan/...`). Use a China key with the `.com` endpoints and a global key with the `.ai` endpoints.
@@ -163,7 +163,7 @@ A single auth flow writes region-matched profiles for both `stepfun` and `stepfu
                 reasoning: true,
                 input: ["text", "image"],
                 thinkingLevelMap: { off: "low", minimal: "low", xhigh: "high", max: "high" },
-                cost: { input: 1, output: 2.7, cacheRead: 0.05, cacheWrite: 0 },
+                cost: { input: 1, output: 2.7, cacheRead: 0.1, cacheWrite: 0 },
                 contextWindow: 1048576,
                 maxTokens: 65536,
               },

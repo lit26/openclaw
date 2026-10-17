@@ -1,3 +1,4 @@
+import type { ActiveMediaModel } from "../../../packages/media-understanding-common/src/active-model.js";
 import type {
   AdmittedRunOperatorAuthority,
   OperationalRunInstanceRef,
@@ -19,7 +20,21 @@ import type { RestoredCronContinuation } from "./agent-handler-helpers.js";
 import type { PreparedAgentRunUserTurn, prepareAgentRunUserTurn } from "./agent-run-user-turn.js";
 import type { AgentTurnIo } from "./types.js";
 
-export type PreparedAgentRunDispatch = {
+export type PreparedAgentRunModelRuntime =
+  | {
+      preparedModelRuntimeLease: PreparedModelRuntimeLease;
+      acquireWorkspaceModelRuntime?: never;
+    }
+  | {
+      /** Retains the dispatch generation until deferred workspace preparation selects its lease. */
+      preparedModelRuntimeLease: PreparedModelRuntimeLease;
+      acquireWorkspaceModelRuntime: (
+        workspaceDir: string | undefined,
+      ) => Promise<PreparedModelRuntimeLease>;
+    };
+
+export type PreparedAgentRunDispatch = PreparedAgentRunModelRuntime & {
+  imageUnderstandingModel?: ActiveMediaModel;
   activeGatewayWorkAdmission: SessionWorkAdmissionLease;
   activeRunAbort: ReturnType<typeof registerChatAbortController>;
   cronCreatorAuthority?: GatewayCronCreatorAuthorityAdmission;
@@ -37,7 +52,6 @@ export type PreparedAgentRunDispatch = {
   resolvedThreadId?: string | number;
   reactivateSubagent: boolean;
   followupCompletion?: FollowupCompletionOwner;
-  preparedModelRuntimeLease: PreparedModelRuntimeLease;
   replyDispatchRuntime: PreparedReplyDispatchRuntime;
   unpersistedOffloadedRefs: OffloadedRef[];
   userTurn: PreparedAgentRunUserTurn;
@@ -56,10 +70,15 @@ export type PrepareAgentRunDispatchParams = Omit<
   | "deferTimeoutCompletion"
   | "admittedSessionId"
   | "resolvedThreadId"
+  | "freshChildStorePath"
 > & {
+  needsImageUnderstanding?: boolean;
+  /** Consumed host-bound child creation facts, never a wire-request option. */
+  freshChild?: boolean;
   assertAdmissionCurrent?: () => void;
   hasCurrentClientAuthority?: () => boolean;
   promptedAt: number;
+  lifecycleStorePath: string;
   requestedSessionKey?: string;
   preAcceptedReservedSessionKey?: string;
   delivery: AgentDeliveryPhaseResult;
@@ -81,7 +100,6 @@ export type PrepareAgentRunDispatchParams = Omit<
   agentDedupeKeys: readonly string[];
   getOwnedAgentDedupeKeys: () => readonly string[];
   io: AgentTurnIo;
-  abortForLifecycleRotation: (target?: { sessionKey?: string; agentId?: string }) => boolean;
   acquireGatewayWorkAdmission: (scope: string) => Promise<void>;
   assertGatewayWorkAdmissionAllowed: () => SessionEntry | undefined;
   hasGatewayAdmissionOutcome: () => boolean;

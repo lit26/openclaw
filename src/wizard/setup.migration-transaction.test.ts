@@ -22,7 +22,6 @@ import {
   listOpenClawRegisteredAgentDatabases,
   registerOpenClawAgentDatabase,
 } from "../state/openclaw-agent-db-registry.js";
-import type { ActivateSetupInferenceDeps } from "../system-agent/setup-inference-core.js";
 import { WizardNavigationError, type WizardPrompter, type WizardSelectParams } from "./prompts.js";
 
 const mocks = vi.hoisted(() => ({
@@ -30,7 +29,7 @@ const mocks = vi.hoisted(() => ({
   currentConfig: undefined as { value: Record<string, unknown> } | undefined,
   provider: undefined as MigrationProviderPlugin | undefined,
   verify: vi.fn(),
-  runEmbedded: vi.fn<NonNullable<ActivateSetupInferenceDeps["runEmbeddedAgent"]>>(),
+  runEmbedded: vi.fn<typeof import("../agents/embedded-agent.js").runEmbeddedAgent>(),
 }));
 
 vi.mock("../plugins/migration-provider-runtime.js", () => ({
@@ -85,7 +84,7 @@ function provider(params: {
   onDeferredApply?: (
     itemId: string,
     ctx: MigrationProviderContext,
-  ) => Promise<"already-satisfied" | "error" | "migrated">;
+  ) => Promise<"error" | "migrated">;
 }): MigrationProviderPlugin {
   return {
     id: "claude",
@@ -147,16 +146,9 @@ function provider(params: {
         if (item.applyPhase === "after-promotion") {
           const status = (await params.onDeferredApply?.(item.id, ctx)) ?? "error";
           items.push(
-            status === "already-satisfied"
-              ? {
-                  ...item,
-                  status: "skipped",
-                  deferredCompletion: true,
-                  reason: "already satisfied",
-                }
-              : status === "migrated"
-                ? { ...item, status }
-                : { ...item, status, reason: "activation failed" },
+            status === "migrated"
+              ? { ...item, status }
+              : { ...item, status, reason: "activation failed" },
           );
           continue;
         }
@@ -320,26 +312,6 @@ describe("transactional setup migration import", () => {
     expect(currentConfig.value).toEqual({});
   });
 
-  it("accepts an already-satisfied retry-safe deferred effect as complete", async () => {
-    const { root, source, currentConfig } = await createImportFixture();
-    mocks.provider = provider({
-      source,
-      deferred: true,
-      onDeferredApply: async () => "already-satisfied",
-    });
-
-    await expect(runImport({ root, source, currentConfig })).resolves.toEqual({
-      kind: "no-imported-inference",
-    });
-
-    const { report, journal } = await readImportReport(root);
-    expect(report.items.find((item) => item.id === "plugin:calendar")).toMatchObject({
-      status: "skipped",
-      deferredCompletion: true,
-    });
-    expect(journal.status).toBe("completed");
-  });
-
   it.each([true, false])(
     "verifies a pre-roster import without durable session admission (provider succeeds: %s)",
     async (providerSucceeds) => {
@@ -400,7 +372,7 @@ describe("transactional setup migration import", () => {
         ).toEqual(credential);
         // Exercise the real first runner boundary: an in-memory transcript alone must not
         // let admission create a final agent database before staged promotion.
-        assertAgentHarnessRunAdmission(params);
+        await assertAgentHarnessRunAdmission(params);
         admitted = true;
         if (!providerSucceeds) {
           throw new Error("provider unavailable");

@@ -76,18 +76,26 @@ describe("embedded lifecycle", () => {
   });
 
   it("omits raw HTML auth bodies from console diagnostics", async () => {
-    const { ctx } = errorContext("403 <!DOCTYPE html><html><body>Access denied</body></html>", {
-      provider: "openai",
-      model: "test-model",
-    });
+    const { ctx, onAgentEvent } = errorContext(
+      "403 <!DOCTYPE html><html><body>Access denied</body></html>",
+      {
+        provider: "openai",
+        model: "test-model",
+      },
+    );
     await handleAgentEnd(ctx);
     expect(warnMeta(ctx)).toMatchObject({
-      error:
-        "Authentication failed at the provider. Re-authenticate and verify your provider credentials and account access.",
       providerRuntimeFailureKind: "auth_html",
     });
     expect(warnMeta(ctx).consoleMessage).not.toContain("rawError=");
     expect(warnMeta(ctx).consoleMessage).not.toContain("<html>");
+    expectEvent(onAgentEvent, {
+      phase: "error",
+      error:
+        "Couldn't sign in to the AI service. Sign in again under Models in the Control UI or run `openclaw configure`.",
+      errorObservation: expect.objectContaining({ providerRuntimeFailureKind: "auth_html" }),
+      livenessState: "blocked",
+    });
   });
 
   it.each([
@@ -96,27 +104,27 @@ describe("embedded lifecycle", () => {
       secret: "sk-abcdefghijklmnopqrstuvwxyz123456",
       error: "LLM request failed.",
       observation: { providerRuntimeFailureKind: "unclassified" },
-      preview: "x-api-key: ***",
     },
     {
-      raw: '{"type":"error","error":{"type":"server_error","message":"Upstream failed x-api-key: SECRET_CANARY_69737"}}',
+      raw: '{"type":"error","error":{"type":"server_error","message":"Upstream failed synthetic-private-tool-output x-api-key: SECRET_CANARY_69737"}}',
       secret: "SECRET_CANARY_69737",
-      error:
-        "⚠️ LLM request failed (provider internal error). This is usually temporary — try again shortly.",
+      error: "⚠️ The AI service is having trouble. Please try again in a moment.",
       observation: {
         providerErrorType: "server_error",
-        providerErrorMessagePreview: "Upstream failed x-api-key: ***",
+        providerErrorMessagePreview: "Upstream failed synthetic-private-tool-output x-api-key: ***",
       },
     },
   ])(
     "redacts provider diagnostics before publishing: $secret",
-    async ({ raw, secret, error, observation, preview }) => {
+    async ({ raw, secret, error, observation }) => {
       const { ctx, onAgentEvent } = errorContext(raw);
       await handleAgentEnd(ctx);
-      expect(warnMeta(ctx).error).toBe(error);
-      if (preview) {
-        expect(warnMeta(ctx).rawErrorPreview).toBe(preview);
-      }
+      expect(warnMeta(ctx)).not.toHaveProperty("error");
+      expect(warnMeta(ctx)).not.toHaveProperty("rawErrorPreview");
+      expect(warnMeta(ctx)).not.toHaveProperty("providerErrorMessagePreview");
+      expect(JSON.stringify(vi.mocked(ctx.log.warn).mock.calls)).not.toContain(
+        "synthetic-private-tool-output",
+      );
       expect(JSON.stringify(onAgentEvent.mock.calls)).not.toContain(secret);
       expect(JSON.stringify(onAgentEvent.mock.calls)).not.toContain("rawError");
       expectEvent(onAgentEvent, {
@@ -133,9 +141,10 @@ describe("embedded lifecycle", () => {
       model: "claude\tsonnet\n4",
     });
     await handleAgentEnd(ctx);
-    expect(warnMeta(ctx).consoleMessage).toBe(
-      "embedded run agent end: runId=run-1 isError=true model=claude sonnet 4 provider=anthropic]8;;https://evil.test error=LLM request failed: connection refused by the provider endpoint. rawError=connection refused",
+    expect(warnMeta(ctx).consoleMessage).toContain(
+      "embedded run agent end: runId=run-1 isError=true model=claude sonnet 4 provider=anthropic]8;;https://evil.test failoverReason=",
     );
+    expect(JSON.stringify(vi.mocked(ctx.log.warn).mock.calls)).not.toContain("connection refused");
     for (const control of ["\n", "\r", "\t", "\u001b", "\u009b"]) {
       expect(warnMeta(ctx).consoleMessage).not.toContain(control);
     }
@@ -314,7 +323,8 @@ describe("embedded lifecycle", () => {
       await end;
       expectEvent(onAgentEvent, {
         phase: "error",
-        error: "LLM request failed: connection refused by the provider endpoint.",
+        error:
+          "Couldn't connect to the AI service. Check your connection, then try again. For details, open Settings → Logs in the Control UI or run `openclaw logs --follow`.",
         errorObservation: expect.objectContaining({ providerRuntimeFailureKind: "timeout" }),
         livenessState: "blocked",
       });

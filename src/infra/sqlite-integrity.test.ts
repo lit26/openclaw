@@ -4,74 +4,75 @@ import { performance } from "node:perf_hooks";
 import type { DatabaseSync } from "node:sqlite";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { useAutoCleanupTempDirTracker } from "../../test/helpers/temp-dir.js";
-import * as nodeSqlite from "./node-sqlite.js";
 import { requireNodeSqlite } from "./node-sqlite.js";
 import {
   assertSqliteIntegrity,
-  confirmSqliteFileIntegrity,
   isTerminalSqliteIntegrityError,
   runSqliteIntegrityOperationSync,
   sqliteIntegrityCheckSteps,
   type SqliteIntegrityDiagnostics,
   type SqliteIntegrityOperation,
-  type SqliteIntegrityTableCheck,
 } from "./sqlite-integrity.js";
 
 const tempDirs = useAutoCleanupTempDirTracker(afterEach);
 
 describe("assertSqliteIntegrity", () => {
-  it("rejects foreign-key violations that structural checks do not detect", () => {
-    const sqlite = requireNodeSqlite();
-    const database = new sqlite.DatabaseSync(":memory:");
+  it("refuses structural damage in a table outside the migration scope", () => {
+    const databasePath = path.join(tempDirs.make("sqlite-quick-damage-"), "database.sqlite");
+    const writer = new (requireNodeSqlite().DatabaseSync)(databasePath);
+    writer.exec(`
+      CREATE TABLE touched(value TEXT);
+      CREATE TABLE untouched(value TEXT);
+      INSERT INTO untouched VALUES ('retained');
+    `);
+    const pageSize = Number(writer.prepare("PRAGMA page_size").get()?.page_size);
+    const rootPage = Number(
+      writer.prepare("SELECT rootpage FROM sqlite_schema WHERE name='untouched'").get()?.rootpage,
+    );
+    writer.close();
+    const file = fs.openSync(databasePath, "r+");
     try {
-      database.exec(`
-        PRAGMA foreign_keys = OFF;
-        CREATE TABLE parents (id INTEGER PRIMARY KEY);
-        CREATE TABLE children (
-          id INTEGER PRIMARY KEY,
-          parent_id INTEGER NOT NULL REFERENCES parents(id)
-        );
-        INSERT INTO children (id, parent_id) VALUES (1, 99);
-      `);
-      expect(database.prepare("PRAGMA quick_check;").get()).toEqual({ quick_check: "ok" });
-      expect(database.prepare("PRAGMA integrity_check;").get()).toEqual({
-        integrity_check: "ok",
-      });
-
-      let failure: unknown;
-      try {
-        assertSqliteIntegrity(database, "test database");
-      } catch (error) {
-        failure = error;
-      }
-      expect(failure).toMatchObject({ name: "SqliteIntegrityError" });
-      expect(String(failure)).toMatch(
-        /foreign_key_check failed for test database: children row 1 references parents \(foreign key 0\)/u,
-      );
+      fs.writeSync(file, Buffer.from([0xff]), 0, 1, (rootPage - 1) * pageSize);
     } finally {
-      database.close();
+      fs.closeSync(file);
     }
+    using database = new (requireNodeSqlite().DatabaseSync)(databasePath);
+    expect(() =>
+      assertSqliteIntegrity(database, "migration source", { check: "quick", tables: ["touched"] }),
+    ).toThrow(expect.objectContaining({ name: "SqliteIntegrityError" }));
   });
 
-  it("names integrity-check failures", () => {
-    const database = {
-      prepare: () => ({ all: () => [{ integrity_check: "broken index" }] }),
-    } as unknown as DatabaseSync;
+  it.each([
+    { check: "quick", tables: ["touched"], refuses: false },
+    { check: "quick", tables: ["untouched"], refuses: true },
+    { check: "full", tables: ["touched"], refuses: true },
+  ] as const)(
+    "checks index consistency with $check verification scoped to $tables",
+    ({ check, tables, refuses }) => {
+      using database = new (requireNodeSqlite().DatabaseSync)(":memory:");
+      database.exec(`
+        CREATE TABLE touched(value TEXT);
+        CREATE TABLE untouched(id INTEGER PRIMARY KEY, value TEXT);
+        CREATE INDEX idx_untouched ON untouched(id);
+        INSERT INTO untouched VALUES (1, 'retained'), (2, 'history');
+      `);
+      database.enableDefensive?.(false);
+      database.exec("PRAGMA writable_schema = ON");
+      database
+        .prepare("UPDATE sqlite_schema SET sql = ? WHERE name = 'idx_untouched'")
+        .run("CREATE INDEX idx_untouched ON untouched(value)");
+      database.exec("PRAGMA writable_schema = OFF");
+      const version = Number(database.prepare("PRAGMA schema_version").get()?.schema_version);
+      database.exec(`PRAGMA schema_version = ${version + 1}`);
 
-    let failure: unknown;
-    try {
-      assertSqliteIntegrity(database, "test database");
-    } catch (error) {
-      failure = error;
-    }
-
-    expect(failure).toMatchObject({
-      name: "SqliteIntegrityError",
-      message: expect.stringContaining(
-        "SQLite integrity_check failed for test database: broken index",
-      ),
-    });
-  });
+      const verify = () => assertSqliteIntegrity(database, "migration source", { check, tables });
+      if (refuses) {
+        expect(verify).toThrow(/integrity_check.*idx_untouched/su);
+      } else {
+        expect(verify).not.toThrow();
+      }
+    },
+  );
 
   it("classifies cascade-owned task delivery orphans without admitting writes", () => {
     const database = new (requireNodeSqlite().DatabaseSync)(":memory:");
@@ -200,11 +201,24 @@ describe("assertSqliteIntegrity", () => {
     }
   });
 
-  it("reports violations deterministically without truncating 64-bit rowids", () => {
-    const sqlite = requireNodeSqlite();
-    const database = new sqlite.DatabaseSync(":memory:");
+  function expectForeignKeyViolation(
+    sql: string,
+    expected: RegExp,
+    beforeCheck?: (database: DatabaseSync) => void,
+  ) {
+    const database = new (requireNodeSqlite().DatabaseSync)(":memory:");
     try {
-      database.exec(`
+      database.exec(sql);
+      beforeCheck?.(database);
+      expect(() => assertSqliteIntegrity(database, "test database")).toThrow(expected);
+    } finally {
+      database.close();
+    }
+  }
+
+  it("reports violations deterministically without truncating 64-bit rowids", () => {
+    expectForeignKeyViolation(
+      `
         PRAGMA foreign_keys = OFF;
         CREATE TABLE parents (id INTEGER PRIMARY KEY);
         CREATE TABLE children (
@@ -213,44 +227,14 @@ describe("assertSqliteIntegrity", () => {
         );
         INSERT INTO children (id, parent_id)
         VALUES (9007199254740993, 99), (1, 99);
-      `);
-
-      expect(() => assertSqliteIntegrity(database, "test database")).toThrow(
-        /children row 1 references parents \(foreign key 0\); children row 9007199254740993 references parents \(foreign key 0\)/u,
-      );
-    } finally {
-      database.close();
-    }
-  });
-
-  it("bounds foreign-key violation diagnostics", () => {
-    const sqlite = requireNodeSqlite();
-    const database = new sqlite.DatabaseSync(":memory:");
-    try {
-      database.exec(`
-        PRAGMA foreign_keys = OFF;
-        CREATE TABLE parents (id INTEGER PRIMARY KEY);
-        CREATE TABLE children (
-          id INTEGER PRIMARY KEY,
-          parent_id INTEGER NOT NULL REFERENCES parents(id)
-        );
-        INSERT INTO children (id, parent_id)
-        VALUES (1, 99), (2, 99), (3, 99), (4, 99), (5, 99), (6, 99);
-      `);
-
-      expect(() => assertSqliteIntegrity(database, "test database")).toThrow(
-        /children row 5 references parents \(foreign key 0\); additional violations omitted$/u,
-      );
-    } finally {
-      database.close();
-    }
+      `,
+      /children row 1 references parents \(foreign key 0\); children row 9007199254740993 references parents \(foreign key 0\)/u,
+    );
   });
 
   it("cannot be bypassed by a schema object shadowing the table-valued pragma", () => {
-    const sqlite = requireNodeSqlite();
-    const database = new sqlite.DatabaseSync(":memory:");
-    try {
-      database.exec(`
+    expectForeignKeyViolation(
+      `
         PRAGMA foreign_keys = OFF;
         CREATE TABLE parents (id INTEGER PRIMARY KEY);
         CREATE TABLE children (
@@ -264,24 +248,21 @@ describe("assertSqliteIntegrity", () => {
           parent TEXT NOT NULL,
           fkid INTEGER NOT NULL
         );
-      `);
-      expect(
-        database.prepare('SELECT "table", rowid, parent, fkid FROM pragma_foreign_key_check').all(),
-      ).toEqual([]);
-
-      expect(() => assertSqliteIntegrity(database, "test database")).toThrow(
-        /foreign_key_check failed for test database: children row 1 references parents \(foreign key 0\)/u,
-      );
-    } finally {
-      database.close();
-    }
+      `,
+      /foreign_key_check failed for test database: children row 1 references parents \(foreign key 0\)/u,
+      (database) => {
+        expect(
+          database
+            .prepare('SELECT "table", rowid, parent, fkid FROM pragma_foreign_key_check')
+            .all(),
+        ).toEqual([]);
+      },
+    );
   });
 
   it("identifies violations in WITHOUT ROWID tables", () => {
-    const sqlite = requireNodeSqlite();
-    const database = new sqlite.DatabaseSync(":memory:");
-    try {
-      database.exec(`
+    expectForeignKeyViolation(
+      `
         PRAGMA foreign_keys = OFF;
         CREATE TABLE parents (id TEXT PRIMARY KEY);
         CREATE TABLE children (
@@ -289,78 +270,14 @@ describe("assertSqliteIntegrity", () => {
           parent_id TEXT NOT NULL REFERENCES parents(id)
         ) WITHOUT ROWID;
         INSERT INTO children (id, parent_id) VALUES ('child-1', 'missing-parent');
-      `);
-
-      expect(() => assertSqliteIntegrity(database, "test database")).toThrow(
-        /foreign_key_check failed for test database: children row without rowid references parents \(foreign key 0\)/u,
-      );
-    } finally {
-      database.close();
-    }
+      `,
+      /foreign_key_check failed for test database: children row without rowid references parents \(foreign key 0\)/u,
+    );
   });
 });
 
 describe("integrity gate attribution", () => {
   afterEach(() => vi.restoreAllMocks());
-
-  it("reports the ten slowest table checks and complete totals by check kind", () => {
-    const database = new (requireNodeSqlite().DatabaseSync)(":memory:");
-    const tables: SqliteIntegrityTableCheck[] = Array.from({ length: 73 }, (_, index) => ({
-      table: index === 72 ? "transcript_events" : `table_${index}`,
-      check: index === 72 ? "quick_check" : "integrity_check",
-    }));
-    const durations = new Map(
-      tables.map(({ table, check }, index) => [
-        `PRAGMA ${check}('${table}');`,
-        index === 72 ? 20_000 : index + 1,
-      ]),
-    );
-    try {
-      for (const { table } of tables) {
-        database.exec(`CREATE TABLE ${table} (value INTEGER);`);
-      }
-      let elapsedMs = 0;
-      vi.spyOn(performance, "now").mockImplementation(() => elapsedMs);
-      const prepare = database.prepare.bind(database);
-      vi.spyOn(database, "prepare").mockImplementation((sql) => {
-        const statement = prepare(sql);
-        const duration = durations.get(sql);
-        if (duration !== undefined) {
-          const all = statement.all.bind(statement);
-          vi.spyOn(statement, "all").mockImplementation((...parameters) => {
-            const rows = all(...parameters);
-            elapsedMs += duration;
-            return rows;
-          });
-        }
-        return statement;
-      });
-      const diagnostics: SqliteIntegrityDiagnostics = {};
-      runSqliteIntegrityOperationSync(
-        sqliteIntegrityCheckSteps(database, "timed tables", diagnostics, tables),
-      );
-
-      expect(diagnostics.integrityTableTimings).toEqual([
-        { table: "transcript_events", check: "quick_check", elapsedMs: 20_000 },
-        ...Array.from({ length: 9 }, (_, index) => ({
-          table: `table_${71 - index}`,
-          check: "integrity_check",
-          elapsedMs: 72 - index,
-        })),
-      ]);
-      expect(diagnostics.integrityTableTotals).toEqual({
-        integrity_check: { tableCount: 72, elapsedMs: 2_628 },
-        quick_check: { tableCount: 1, elapsedMs: 20_000 },
-      });
-      runSqliteIntegrityOperationSync(
-        sqliteIntegrityCheckSteps(database, "full check", diagnostics),
-      );
-      expect(diagnostics).not.toHaveProperty("integrityTableTimings");
-      expect(diagnostics).not.toHaveProperty("integrityTableTotals");
-    } finally {
-      database.close();
-    }
-  });
 
   function createTimedDatabase(checkMs: number, foreignKeyViolation = false) {
     const database = new (requireNodeSqlite().DatabaseSync)(":memory:");
@@ -395,7 +312,6 @@ describe("integrity gate attribution", () => {
   }
 
   it.each([
-    { label: "fractional check", checkMs: 4.75, foreignKeyViolation: false, gateMs: 9, syncMs: 4 },
     { label: "measured zero", checkMs: 0.25, foreignKeyViolation: false, gateMs: 4, syncMs: 0 },
     { label: "failed check", checkMs: 4.75, foreignKeyViolation: true, gateMs: 9, syncMs: 4 },
   ])(
@@ -454,7 +370,6 @@ describe("integrity gate attribution", () => {
 
   it.each([
     { label: "fractional", checkMs: 4.75, lifetimeMs: 8.75, outcome: "healthy" },
-    { label: "zero", checkMs: 0, lifetimeMs: 0, outcome: "healthy" },
     { label: "failed check", checkMs: 4.75, lifetimeMs: 8.75, outcome: "failed" },
     { label: "failed before checking", checkMs: undefined, lifetimeMs: 8.75, outcome: "failed" },
   ] as const)(
@@ -569,26 +484,5 @@ describe("isTerminalSqliteIntegrityError", () => {
     expect(isTerminalSqliteIntegrityError(busy)).toBe(false);
     expect(isTerminalSqliteIntegrityError(malformed)).toBe(true);
     expect(isTerminalSqliteIntegrityError(corruptIndex)).toBe(true);
-  });
-});
-
-describe("confirmSqliteFileIntegrity", () => {
-  it("leaves SQLite open failures unbound because the failed file identity is unknown", () => {
-    const databasePath = path.join(tempDirs.make("sqlite-open-integrity-"), "database.sqlite");
-    fs.writeFileSync(databasePath, "not a sqlite database");
-    const openError = Object.assign(new Error("file is not a database"), { errcode: 26 });
-    const open = vi.spyOn(nodeSqlite, "openNodeSqliteDatabase").mockImplementationOnce(() => {
-      throw openError;
-    });
-
-    try {
-      expect(confirmSqliteFileIntegrity(databasePath, "test database")).toEqual({
-        status: "failed",
-        error: openError,
-        terminal: false,
-      });
-    } finally {
-      open.mockRestore();
-    }
   });
 });

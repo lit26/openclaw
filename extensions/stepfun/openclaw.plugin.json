@@ -32,6 +32,16 @@
     ]
   },
   "modelCatalog": {
+    "aliases": {
+      "stepfun-ai": {
+        "provider": "stepfun",
+        "api": "openai-completions"
+      },
+      "stepfun-ai-step-plan": {
+        "provider": "stepfun-plan",
+        "api": "openai-completions"
+      }
+    },
     "modelsDev": {
       "stepfun": "stepfun-ai",
       "stepfun-plan": "stepfun-ai-step-plan"
@@ -57,7 +67,7 @@
             "cost": {
               "input": 1,
               "output": 2.7,
-              "cacheRead": 0.05,
+              "cacheRead": 0.1,
               "cacheWrite": 0
             },
             "compat": {

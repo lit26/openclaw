@@ -4,6 +4,7 @@ import type {
 } from "../../../config/sessions/session-entry-current.types.js";
 import type { SessionEntry } from "../../../config/sessions/types.js";
 import type { SubagentEndReason } from "../../../context-engine/types.js";
+import type { RestartRecoveryOperatorSource } from "../../../gateway/operator-run-recovery-source.js";
 import type { DeliveryContext } from "../../../utils/delivery-context.types.js";
 import type { AgentRunTerminalReplySnapshot } from "../../agent-run-terminal-reply.types.js";
 import type { AgentRunSessionTarget } from "../../run-session-target.types.js";
@@ -26,6 +27,7 @@ export type SubagentSessionEffects = {
 export type SubagentRecoveryCurrent = {
   prepare(): Promise<boolean>;
   isHostCurrent(): boolean;
+  onPublished?(entry: SubagentRunRecord): void;
 };
 
 export type SubagentCompletionRequest = {
@@ -47,6 +49,8 @@ export type SubagentCompletionRequest = {
   sessionEffects?: SubagentSessionEffects;
   completionSnapshot?: { resultText: string | null; capturedAt: number };
   terminalReply?: AgentRunTerminalReplySnapshot;
+  /** Explicitly settle a yielded run that no continuation can reach; kill is the only other exception. */
+  settleYielded?: true;
 };
 
 export type ContextEngineSubagentEndedParams = {
@@ -134,12 +138,16 @@ export type RequesterSettleWakeState = {
   requesterYieldBatch?: true;
   /** Present only when an idle requester needs a new turn after yielding. */
   afterRequesterYield?: true;
+  /**
+   * A yielded batch with private results was admitted with a deliverable requester
+   * final. Absent on a dispatching private batch means an earlier build admitted it
+   * as a private turn; replay keeps that policy.
+   */
+  yieldedFinalDeliverable?: true;
   /** Monotonic process generation protecting a newer yield from stale completion. */
   rearmGeneration?: number;
   /** Reference to the conversation receipt for this presentation, not completion credit. */
   progressOperationId?: string;
-  /** Number of times this batch has been deferred due to unsettled descendants. */
-  deferralCount?: number;
   lastError?: string | null;
   /** Cleanup wanted to retire this row; defer deletion until the outbox resolves. */
   retireAfterSettle?: boolean;
@@ -165,8 +173,9 @@ type SubagentKillIntent = {
   suppressTaskDelivery?: boolean;
 };
 
-/** Persisted execution, completion, delivery, and attachment state for child runs. */
 export type SubagentRunRecord = Omit<SubagentRunReadRecord, "execution" | "collectorCompletion"> & {
+  /** Admission evidence only; restart continuation revalidates the live operator grant. */
+  operatorRecoverySource?: RestartRecoveryOperatorSource;
   /** Child identity stays fixed when recovery redirects transcript writes. */
   childSessionIdentity?: Pick<SessionEntry, "sessionId" | "lifecycleRevision">;
   /** Exact requester attempt for cancellation, independent of completion messaging. */
@@ -220,12 +229,8 @@ export type SubagentRunRecord = Omit<SubagentRunReadRecord, "execution" | "colle
   retainAttachmentsOnKeep?: boolean;
   /** Spawner plus ancestor sessions authorized to wait, frozen when the collector is registered. */
   swarmWaitOwnerSessionKeys?: string[];
-  /** Stable scheduler slot identity across gateway-assigned run id replacements. */
-  schedulerSlotId?: string;
   /** Exact host-reserved Gateway request identity for the current collector turn. */
   swarmLaunchIdempotencyKey?: string;
-  /** Replay-safe host bridge identity used to recover a collector after restart. */
-  swarmLaunchReplayKey?: string;
   /** Canonical collector request hash paired with a host-reserved launch identity. */
   swarmLaunchRequestFingerprint?: string;
   /** True only between host reservation and accepted Gateway dispatch. */
@@ -245,6 +250,7 @@ export type SubagentRunMaintenanceRecord = Pick<
   SubagentRunRecord,
   | "runId"
   | "childSessionKey"
+  | "childAgentId"
   | "requesterSessionKey"
   | "createdAt"
   | "cleanupCompletedAt"
@@ -262,12 +268,14 @@ export type SubagentRegistrationScope = {
   readonly canLaunch: () => boolean;
   readonly canCleanupSession: () => boolean;
   readonly canAcceptLaunch: () => boolean;
+  readonly canAbortAcceptedRun: () => boolean;
   readonly canRetireReservation: () => boolean;
   readonly settleFailedLaunch: (error: string) => Promise<void>;
 };
 
 export type RegisterSubagentRunOptions = {
-  persistence?: "worker";
+  /** An accepted dispatch replay retains its original completion owner and waiter. */
+  acceptedRunReplay?: true;
   assertCurrent?: () => void;
   assertPublicationCurrent?: () => void;
   retainOwnership?: (scope: SubagentRegistrationScope) => void;

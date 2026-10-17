@@ -2,16 +2,22 @@ import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { isRecord } from "@openclaw/normalization-core/record-coerce";
+import {
+  UPDATE_PARENT_RUNS_POST_ACTIVATION_INSPECTIONS_ENV,
+  UPDATE_POST_ACTIVATION_INSPECTIONS_REPORT_MODE,
+} from "../../commands/doctor/shared/update-phase.js";
 import { resolveStateDir } from "../../config/paths.js";
 import type { OpenClawConfig } from "../../config/types.openclaw.js";
 import { formatErrorMessage } from "../../infra/errors.js";
+import { resolveUserPath } from "../../infra/home-dir.js";
 import { runtimeProcessEntrypoints } from "../../infra/runtime-process-entrypoints.js";
+import { readUpdateStateSchemaVersions } from "../../infra/update-candidate-state.js";
 import {
-  readUpdateStateSchemaVersions,
   resolveUpdateStateContentVersion,
   updateStateSchemaVersionsMatch,
-} from "../../infra/update-candidate-state.js";
+} from "../../infra/update-candidate-state.versions.js";
 import { resolveUpdateFinalizationTimeoutMs } from "../../infra/update-finalization-budget.js";
+import { unsafeUpdateRecovery } from "../../infra/update-recovery.js";
 import type { UpdateRunStep } from "../../infra/update-run-record.js";
 import { isUpdateGatewayReadinessPending } from "../../infra/update-run-step.js";
 import { createUpdateTimeoutHandoff } from "../../infra/update-timeout-provenance.js";
@@ -57,6 +63,14 @@ export async function inspectActivatedUpdateState(
   if (!schemaVersions) {
     return undefined;
   }
+  const agentPaths = new Set(
+    [env.OPENCLAW_AGENT_DIR, env.PI_CODING_AGENT_DIR].flatMap((directory) =>
+      directory?.trim()
+        ? [path.join(resolveUserPath(directory, env), "openclaw-agent.sqlite")]
+        : [],
+    ),
+  );
+  let blocked: FinishUpdateParams["rollbackBlockedReason"];
   try {
     const current = await readUpdateStateSchemaVersions({
       stateDir: resolveStateDir(env),
@@ -65,13 +79,33 @@ export async function inspectActivatedUpdateState(
       root: result.root ?? null,
       nodeRunner: params.packageUpdateNodeRunner,
       timeoutMs: params.timeoutMs,
+      includeRetainedAgentPaths: true,
+      onInventory: (files) => {
+        for (const database of files.values()) {
+          if (
+            database.owners?.some(({ role }) => role === "agent") ||
+            database.registeredPaths?.length
+          ) {
+            database.spellings.forEach((pathname) => agentPaths.add(pathname));
+          }
+        }
+      },
     });
     const shared = current.find((entry) => entry.path === resolveOpenClawStateSqlitePath(env));
     const sharedVersion = shared ? resolveUpdateStateContentVersion(shared) : undefined;
+    const incompleteAgents = candidateSchemaVersions
+      ? current.filter(
+          (entry) =>
+            agentPaths.has(entry.path) &&
+            !shared?.retainedAgentPaths?.includes(entry.path) &&
+            entry.userVersion !== null &&
+            entry.userVersion !== candidateSchemaVersions.agent,
+        )
+      : [];
     if (
       result.status === "ok" &&
       candidateSchemaVersions &&
-      sharedVersion !== candidateSchemaVersions.state
+      (sharedVersion !== candidateSchemaVersions.state || incompleteAgents.length > 0)
     ) {
       // Doctor can warn without failing. Require applied content so startup
       // cannot migrate late; deferred publication alone is already ready.
@@ -83,10 +117,20 @@ export async function inspectActivatedUpdateState(
         cwd: result.root ?? root,
         durationMs: 0,
         exitCode: 1,
-        stderrTail: `Shared state migration did not finish: expected schema ${candidateSchemaVersions.state}, found ${sharedVersion ?? "missing"}.`,
+        stderrTail: [
+          ...(sharedVersion !== candidateSchemaVersions.state
+            ? [
+                `Shared state migration did not finish: expected schema ${candidateSchemaVersions.state}, found ${sharedVersion ?? "missing"}.`,
+              ]
+            : []),
+          ...incompleteAgents.map(
+            (entry) =>
+              `Agent database migration did not finish: ${entry.path}; expected schema ${candidateSchemaVersions.agent}, found ${entry.userVersion}.`,
+          ),
+        ].join("\n"),
       });
     }
-    return updateStateSchemaVersionsMatch(schemaVersions, current, {
+    blocked = updateStateSchemaVersionsMatch(schemaVersions, current, {
       sharedPath: resolveOpenClawStateSqlitePath(env),
       candidateSchemaVersions,
     })
@@ -103,8 +147,12 @@ export async function inspectActivatedUpdateState(
       exitCode: 1,
       stderrTail: formatErrorMessage(error),
     });
-    return "rollback-state-unverified";
+    blocked = "rollback-state-unverified";
   }
+  if (blocked && result.status === "error") {
+    result.recovery = unsafeUpdateRecovery(result.recovery, blocked);
+  }
+  return blocked;
 }
 
 /** After migration, only candidate code may reopen state or finish the run. */
@@ -112,10 +160,9 @@ export async function continueMigratedUpdateInFreshProcess(
   params: FinishUpdateParams,
   bufferedSteps: UpdateRunStep[],
 ): Promise<
-  Pick<
-    MigratedUpdateFinalizationResult,
-    "result" | "exitCode" | "automaticTriage" | "candidateStartAttempted"
-  > & { databaseRollbackAvailable?: true }
+  Pick<MigratedUpdateFinalizationResult, "result" | "exitCode" | "candidateStartAttempted"> & {
+    databaseRollbackAvailable?: true;
+  }
 > {
   if (params.opts.recovery) {
     throw new UpdateCommandRecoveryPendingError("Full-state checkpoint recovery is deferred.");
@@ -138,16 +185,27 @@ export async function continueMigratedUpdateInFreshProcess(
       params.packageUpdateNodeRunner ?? resolveNodeRunner(),
       path.join(root, "dist", runtimeProcessEntrypoints.updateMigratedFinalize.distWorkerPath),
     ];
-    const workerEnv = {
-      ...stripGatewayServiceMarkerEnv(
-        resolveUpdatedInstallCommandEnv({
-          processEnv: params.ownedManagedUpdateEnv ?? run.env,
-        }),
-      ),
-      OPENCLAW_UPDATE_IN_PROGRESS: "1",
-      TMPDIR: scratchDir,
-      TMP: scratchDir,
-      TEMP: scratchDir,
+    const workerOptions = {
+      cwd: root,
+      baseEnv: {},
+      env: {
+        ...stripGatewayServiceMarkerEnv(
+          resolveUpdatedInstallCommandEnv({
+            processEnv: params.ownedManagedUpdateEnv ?? run.env,
+          }),
+        ),
+        OPENCLAW_UPDATE_IN_PROGRESS: "1",
+        // This worker finishes the run, including the deferred post-activation inspections.
+        [UPDATE_PARENT_RUNS_POST_ACTIVATION_INSPECTIONS_ENV]: params.shouldRestart
+          ? UPDATE_POST_ACTIVATION_INSPECTIONS_REPORT_MODE
+          : "0",
+        TMPDIR: scratchDir,
+        TMP: scratchDir,
+        TEMP: scratchDir,
+      },
+      killProcessTree: true,
+      requireProcessTreeExtinction: true,
+      killGraceMs: 500,
     };
     if (run.executorFence || run.completionOwner) {
       assertCurrent();
@@ -157,13 +215,8 @@ export async function continueMigratedUpdateInFreshProcess(
       // Compatibility only, never authority. An older installed worker ignores
       // new JSON fields, so refuse before exposing any continuation input.
       const check = await runUtf8CommandWithTimeout([...workerCommand, "--check"], {
-        cwd: root,
-        baseEnv: {},
-        env: workerEnv,
+        ...workerOptions,
         timeoutMs: params.updateStepTimeoutMs,
-        killProcessTree: true,
-        requireProcessTreeExtinction: true,
-        killGraceMs: 500,
         maxOutputBytes: 64 * 1024,
       });
       assertCurrent();
@@ -234,6 +287,7 @@ export async function continueMigratedUpdateInFreshProcess(
       requesterAuthority,
       executorFence,
       sourceArtifactLock: _sourceArtifactLock,
+      deadline: _deadline,
       ...runIdentity
     } = run;
     const input: MigratedUpdateFinalizationInput = {
@@ -262,17 +316,12 @@ export async function continueMigratedUpdateInFreshProcess(
       bindChild?: (pid: number, argv?: readonly string[]) => void,
     ) =>
       runUtf8CommandWithTimeout(workerCommand, {
-        cwd: root,
-        baseEnv: {},
-        env: workerEnv,
+        ...workerOptions,
         input: JSON.stringify({ ...input, ...(grant ? { executor: grant } : {}) }),
         beforeInput: bindChild,
         // Only an operator deadline bounds forward finalization. Probes and
         // cancellation settlement keep their separate finite allowances.
-        timeoutMs: run.activationTimeoutMs,
-        killProcessTree: true,
-        requireProcessTreeExtinction: true,
-        killGraceMs: 500,
+        timeoutMs: run.deadline?.remainingMs() ?? run.activationTimeoutMs,
         maxOutputBytes: 1024 * 1024,
       });
     await releaseLegacySourceLock(root, run.sourceArtifactLock);
@@ -305,7 +354,6 @@ export async function continueMigratedUpdateInFreshProcess(
     const finalization = {
       result: response.result,
       exitCode: response.exitCode,
-      automaticTriage: response.automaticTriage,
       candidateStartAttempted: response.candidateStartAttempted,
     };
     const restoreDatabases =

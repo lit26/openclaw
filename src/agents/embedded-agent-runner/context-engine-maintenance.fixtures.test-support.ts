@@ -3,6 +3,7 @@ import { expect, vi } from "vitest";
 import { createDeferred } from "../../../test/helpers/promise.js";
 import type { SessionTranscriptRuntimeTarget } from "../../config/sessions/session-accessor.js";
 import type { ContextEngine } from "../../context-engine/types.js";
+import type { SessionManagerCore } from "../sessions/session-manager-core.js";
 
 export function createBackgroundMaintenanceEngine(
   maintain: NonNullable<ContextEngine["maintain"]>,
@@ -41,32 +42,32 @@ export function expectRecordFields(
 
 export async function loadContextEngineMaintenanceModuleForTest() {
   // Import once and reset the owned singleton state between cases.
-  const { runContextEngineMaintenance, waitForDeferredTurnMaintenanceForSession } =
-    await import("./context-engine-maintenance.js");
+  const { runContextEngineMaintenance } = await import("./context-engine-maintenance.js");
+  const { waitForSessionMaintenance } = await import("../session-maintenance/coordinator.js");
   const { resetDeferredTurnMaintenanceStateForTest } =
     await import("./context-engine-maintenance.test-support.js");
   resetDeferredTurnMaintenanceStateForTest();
   return {
     runContextEngineMaintenance,
-    waitForDeferredTurnMaintenanceForSession,
+    waitForSessionMaintenance,
     resetDeferredTurnMaintenanceStateForTest,
   };
 }
 
 export function createMaintenanceSessionManagerOpenFixture() {
-  let current: { getSessionTarget: () => SessionTranscriptRuntimeTarget } | undefined;
-  const open = vi.fn((target: SessionTranscriptRuntimeTarget) => {
-    current = { getSessionTarget: () => target };
+  let current: Pick<SessionManagerCore, "getSessionTarget" | "getSessionId"> | undefined;
+  const openAsync = vi.fn(async (target: SessionTranscriptRuntimeTarget) => {
+    current = { getSessionTarget: () => target, getSessionId: () => target.sessionId };
     return current;
   });
   return {
-    open,
+    openAsync,
     get current() {
       return current;
     },
     reset() {
       current = undefined;
-      open.mockClear();
+      openAsync.mockClear();
     },
   };
 }

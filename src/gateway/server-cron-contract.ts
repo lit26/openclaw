@@ -7,13 +7,15 @@ export type GatewayCronServiceContract = CronServiceContract & {
   /** Cancel exact current definitions under the serving scheduler's operation lock. */
   quiesceJobs(
     jobs: readonly { id: string; revision: string }[],
-    commitGuard: () => void,
+    commitGuard: (cancel: () => void) => void | Promise<void>,
   ): Promise<void>;
   /** Remove an owned declarative job family from obsolete SQLite store partitions. */
   removeStaleJobFamily(
     family: { declarationKey: string; name: string; ownerPluginTag: string },
     opts?: { commitGuard?: () => void },
   ): Promise<number>;
+  /** True once an accepted manual run wrote its terminal history row; false on timeout or abort. */
+  waitForManualRun(runId: string, timeoutMs: number, signal?: AbortSignal): Promise<boolean>;
   readScratch(
     id: string,
     options?: { assertCurrent?: () => void; signal?: AbortSignal },

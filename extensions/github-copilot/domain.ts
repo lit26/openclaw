@@ -36,19 +36,14 @@ export function normalizeGithubCopilotOAuthScope(raw: string | undefined): strin
   if (!trimmed) {
     return undefined;
   }
-  try {
-    const hostname = new URL(trimmed.includes("://") ? trimmed : `https://${trimmed}`).hostname;
-    return isSupportedGithubCopilotDomain(hostname) && hostname
-      ? normalizeGithubCopilotDomain(hostname)
-      : undefined;
-  } catch {
-    return undefined;
-  }
+  const hostname = URL.parse(trimmed.includes("://") ? trimmed : `https://${trimmed}`)?.hostname;
+  return hostname && isSupportedGithubCopilotDomain(hostname)
+    ? normalizeGithubCopilotDomain(hostname)
+    : undefined;
 }
 
 function readConfiguredGithubCopilotDomain(config?: OpenClawConfig): string | undefined {
-  const params = config?.models?.providers?.["github-copilot"]?.params;
-  const value = params && typeof params === "object" ? params.githubDomain : undefined;
+  const value = config?.models?.providers?.["github-copilot"]?.params?.githubDomain;
   return typeof value === "string" && value.trim().length > 0 ? value.trim() : undefined;
 }
 

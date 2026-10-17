@@ -4,7 +4,6 @@ import type { ProviderRuntimeModel } from "../../plugins/provider-runtime-model.
 import { DEFAULT_CONTEXT_TOKENS } from "../defaults.js";
 import { resolveProviderModelInput } from "./model.inline-provider.js";
 
-/** Converts a normalized catalog row into the provider runtime model shape. */
 export function modelFromStaticCatalogRow(row: NormalizedModelCatalogRow): ProviderRuntimeModel {
   return {
     id: row.id,
@@ -19,6 +18,7 @@ export function modelFromStaticCatalogRow(row: NormalizedModelCatalogRow): Provi
     contextWindows: row.contextWindows?.map((option) => ({ ...option })),
     contextWindowDefault: row.contextWindowDefault,
     contextTokens: row.contextTokens,
+    ...(row.parameterCount !== undefined ? { parameterCount: row.parameterCount } : {}),
     maxTokens: row.maxTokens ?? DEFAULT_CONTEXT_TOKENS,
     thinkingLevelMap: row.thinkingLevelMap ? { ...row.thinkingLevelMap } : undefined,
     headers: row.headers,

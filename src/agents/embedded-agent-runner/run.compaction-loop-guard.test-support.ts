@@ -14,7 +14,6 @@ import type {
   recordToolCallOutcome as RecordToolCallOutcomeType,
   recordToolCall as RecordToolCallType,
 } from "../tool-loop-detection.js";
-import type { PostCompactionLoopPersistedError as PostCompactionLoopPersistedErrorType } from "./post-compaction-loop-guard.js";
 import {
   type makeAttemptResult,
   makeCompactionSuccess,
@@ -43,12 +42,19 @@ let getDiagnosticSessionState: typeof GetDiagnosticSessionStateType;
 let recordToolCall: typeof RecordToolCallType;
 let recordToolCallOutcome: typeof RecordToolCallOutcomeType;
 let wrapToolWithBeforeToolCallHook: typeof WrapToolWithBeforeToolCallHookType;
-let PostCompactionLoopPersistedError: typeof PostCompactionLoopPersistedErrorType;
 
 // Mirror the production trim cap (resolveLoopDetectionConfig default
 // historySize = 30). The trim is what makes the seq-based observation
 // non-trivially better than an absolute index cursor.
 const HISTORY_TRIM_CAP = 30;
+const POST_COMPACTION_ABORT_DETAILS = {
+  name: "PostCompactionLoopPersistedError",
+  detector: "compaction_loop_persisted",
+  count: 3,
+  toolName: "gateway",
+  message:
+    "CRITICAL: tool gateway repeated 3 times with identical arguments and identical results within 3 attempts after auto-compaction. The compaction did not break the loop. Aborting to prevent runaway resource use.",
+};
 
 function recordToolOutcome(
   diagnosticState: SessionState,
@@ -61,7 +67,7 @@ function recordToolOutcome(
   // state without running a wrapped tool.
   const toolCallId = `${toolName}-${diagnosticState.toolCallHistory?.length ?? 0}`;
   const scope = runId ? { runId } : undefined;
-  recordToolCall(diagnosticState, toolName, toolParams, toolCallId, undefined, scope);
+  recordToolCall(diagnosticState, toolName, toolParams, toolCallId, scope);
   const outcome: Parameters<typeof recordToolCallOutcome>[1] = {
     toolName,
     toolParams,
@@ -115,7 +121,6 @@ describe("post-compaction loop guard wired into runEmbeddedAgent", () => {
       await import("../../logging/diagnostic-session-state.js"));
     ({ recordToolCall, recordToolCallOutcome } = await import("../tool-loop-detection.js"));
     ({ wrapToolWithBeforeToolCallHook } = await import("../agent-tools.before-tool-call.js"));
-    ({ PostCompactionLoopPersistedError } = await import("./post-compaction-loop-guard.js"));
   });
 
   beforeEach(async () => {
@@ -189,6 +194,10 @@ describe("post-compaction loop guard wired into runEmbeddedAgent", () => {
       const { prepareSystemAgentRunAdmission } = await import("../admitted-run-context.js");
       const { createSubagentRunRecord } = await import("../subagent-test-fixtures.test-helpers.js");
       const { subagentRuns } = await import("../subagents/registry/subagent-registry-memory.js");
+      const { mutateSubagentRuns } =
+        await import("../subagents/registry/subagent-registry-persistence.js");
+      const { addSubagentRunForTests } =
+        await import("../subagents/registry/subagent-registry.test-helpers.js");
       const admission = prepareSystemAgentRunAdmission(
         {},
         baseParams.runId,
@@ -205,7 +214,6 @@ describe("post-compaction loop guard wired into runEmbeddedAgent", () => {
         completion: { required: true },
         delivery: { status: "pending" },
       });
-      subagentRuns.set(child.runId, child);
       const overflowError = makeOverflowError();
       let attemptReturned = false;
       let attemptSignalAborted = false;
@@ -260,21 +268,30 @@ describe("post-compaction loop guard wired into runEmbeddedAgent", () => {
       );
 
       try {
-        await expect(
-          runEmbeddedAgent({ ...session.runParams, preparedRunAdmission: admission }),
-        ).rejects.toBeInstanceOf(PostCompactionLoopPersistedError);
-        expect(child.requesterTurnRunId).toBe(revoked ? baseParams.runId : undefined);
-        expect(child.requesterSettleWake).toBeUndefined();
+        await addSubagentRunForTests(child);
+        const run = runEmbeddedAgent({ ...session.runParams, preparedRunAdmission: admission });
+        await expect(run).rejects.toMatchObject(POST_COMPACTION_ABORT_DETAILS);
+        await expect(run).rejects.toBe(attemptSignalReason);
+        const current = subagentRuns.get(child.runId);
+        expect(current).toBeDefined();
+        expect(current?.requesterTurnRunId).toBe(revoked ? baseParams.runId : undefined);
+        expect(current?.requesterSettleWake).toBeUndefined();
       } finally {
-        subagentRuns.delete(child.runId);
-        admission.close();
+        try {
+          await mutateSubagentRuns([child.runId], () => ({
+            value: undefined,
+            postimages: new Map([[child.runId, null]]),
+          }));
+        } finally {
+          admission.close();
+        }
       }
 
       expect(mockedCompactDirect).toHaveBeenCalledTimes(1);
       expect(mockedRunEmbeddedAttempt).toHaveBeenCalledTimes(2);
       expect(attemptReturned).toBe(true);
       expect(attemptSignalAborted).toBe(true);
-      expect(attemptSignalReason).toBeInstanceOf(PostCompactionLoopPersistedError);
+      expect(attemptSignalReason).toBeInstanceOf(Error);
     },
   );
 
@@ -652,8 +669,8 @@ describe("post-compaction loop guard wired into runEmbeddedAgent", () => {
       }),
     );
 
-    await expect(runEmbeddedAgent(session.runParams)).rejects.toBeInstanceOf(
-      PostCompactionLoopPersistedError,
+    await expect(runEmbeddedAgent(session.runParams)).rejects.toMatchObject(
+      POST_COMPACTION_ABORT_DETAILS,
     );
 
     expect(mockedCompactDirect).toHaveBeenCalledTimes(1);

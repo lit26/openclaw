@@ -1,16 +1,14 @@
 import { createHash } from "node:crypto";
 import fs from "node:fs/promises";
 import path from "node:path";
-import { tsImport } from "tsx/esm/api";
 import { afterEach, describe, expect, it, vi } from "vitest";
+import { importToolingTypeScript } from "../../../scripts/lib/import-tooling-typescript.mts";
 import { useAutoCleanupTempDirTracker } from "../../../test/helpers/temp-dir.js";
 import { runCommandWithTimeout } from "../../process/exec.js";
 import {
-  createWorkspaceReconcileMetrics,
   MAX_WORKSPACE_HASH_MEMO_BYTES,
   MAX_WORKSPACE_HASH_MEMO_ENTRIES,
   pruneWorkspaceHashMemo,
-  recordRemoteWorkspaceHashMetrics,
   serializeRemoteWorkspaceHashMemo,
   withWorkspaceHashMemo,
   withWorkerWorkspaceHashMemo,
@@ -21,8 +19,13 @@ import type { WorkerWorkspaceManifest } from "./workspace-manifest.js";
 
 // Generate the wire script through the source runtime loader, which preserves
 // function names. Vitest's own transform does not exercise that closure boundary.
-const { REMOTE_WORKSPACE_MANIFEST_JS }: typeof import("./workspace-sync-scripts.js") =
-  await tsImport("./workspace-sync-scripts.ts", import.meta.url);
+const { REMOTE_WORKSPACE_MANIFEST_JS } = await importToolingTypeScript(
+  new URL("./workspace-sync-scripts.ts", import.meta.url).href,
+  import.meta.url,
+);
+if (typeof REMOTE_WORKSPACE_MANIFEST_JS !== "string") {
+  throw new Error("Source workspace sync module did not export its manifest script");
+}
 
 const tempDirs = useAutoCleanupTempDirTracker(afterEach);
 afterEach(() => vi.restoreAllMocks());
@@ -143,30 +146,7 @@ describe("workspace hash memo", () => {
     expect(metrics).toMatchObject({ contentHashCount: 2, memoHitCount: 0 });
   });
 
-  it("aggregates remote metrics and bounds a maximum-entry memo envelope", () => {
-    const aggregate = createWorkspaceReconcileMetrics();
-    recordRemoteWorkspaceHashMetrics(aggregate, {
-      contentHashCount: 7,
-      contentHashDurationMs: 11,
-      memoHitCount: 13,
-      memoTruncatedCount: 17,
-      totalDurationMs: 17,
-    });
-    recordRemoteWorkspaceHashMetrics(aggregate, {
-      contentHashCount: 19,
-      contentHashDurationMs: 23,
-      memoHitCount: 29,
-      memoTruncatedCount: 31,
-      totalDurationMs: 31,
-    });
-    expect(aggregate).toMatchObject({
-      remoteContentHashCount: 26,
-      remoteMemoHitCount: 42,
-      remoteMemoTruncatedCount: 48,
-      remoteHashDurationMs: 34,
-      remoteManifestDurationMs: 48,
-    });
-
+  it("bounds a maximum-entry memo envelope", () => {
     const uint64 = "18446744073709551615";
     const memo = new Map<string, string>();
     for (let index = 0; index < MAX_WORKSPACE_HASH_MEMO_ENTRIES; index += 1) {

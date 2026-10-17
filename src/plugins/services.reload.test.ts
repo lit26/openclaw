@@ -13,10 +13,9 @@ import { resetPluginRuntimeStateForTest } from "./runtime.js";
 import { listPluginServiceHealthFailures } from "./service-health.js";
 import {
   PLUGIN_SERVICE_REPLACEMENT_STOP_TIMEOUT_MS,
-  startPluginServices,
   type PluginServicesHandle,
 } from "./services.js";
-import { createRegistry } from "./services.test-support.js";
+import { createRegistry, startPluginServices } from "./services.test-support.js";
 import { createPluginRecord } from "./status.test-helpers.js";
 import type { OpenClawPluginServiceContext } from "./types.js";
 
@@ -87,6 +86,152 @@ describe("plugin service reload", () => {
     await handle.stop();
     expect(stops).toEqual([first, next, final]);
     expect(registry.httpRoutes).toEqual([]);
+  });
+
+  it.each([
+    "automatic",
+    "retry",
+    "handoff",
+    "deferred-handoff",
+    "shutdown",
+    "selective-stop",
+    "failed-cleanup",
+  ] as const)("retains a timed-out reload until cleanup settles (%s)", async (recovery) => {
+    vi.useFakeTimers();
+    const entered = createDeferredCore();
+    const release = createDeferredCore();
+    const siblingEntered = createDeferredCore();
+    const siblingRelease = createDeferredCore();
+    const contexts: OpenClawPluginServiceContext[] = [];
+    const restarted = createDeferredCore();
+    let watching = false;
+    const held = {
+      id: "held",
+      start: vi.fn((context: OpenClawPluginServiceContext) => {
+        contexts.push(context);
+        watching = true;
+        if (contexts.length === 2) {
+          restarted.resolve();
+        }
+      }),
+      stop: vi.fn(async () => {
+        entered.resolve();
+        await release.promise;
+        watching = false;
+      }),
+    };
+    const sibling = {
+      id: "sibling",
+      start: vi.fn(),
+      stop: vi.fn(() => {
+        siblingEntered.resolve();
+        return siblingRelease.promise;
+      }),
+    };
+    const handoff = recovery === "handoff" || recovery === "deferred-handoff";
+    const registry = createRegistry(handoff ? [held, sibling] : [sibling, held], "reload-owner");
+    const handle = await startPluginServices({
+      registry,
+      config: {},
+      broadcastPluginEvent: vi.fn(),
+    });
+    handles.add(handle);
+    if (handoff) {
+      siblingRelease.resolve();
+    }
+    const next = configFor("https://next.example");
+    const successorConfig = configFor("https://successor.example");
+    const reloading = handle.reload(next, new Set([held.id, sibling.id]));
+    let current = handle;
+    let transfer: Promise<PluginServicesHandle> | undefined;
+    try {
+      await entered.promise;
+      if (handoff) {
+        transfer = startPluginServices({
+          registry,
+          config: successorConfig,
+          broadcastPluginEvent: vi.fn(),
+          previous: handle,
+          ...(recovery === "deferred-handoff"
+            ? { deferStartForPluginIds: new Set(["reload-owner"]) }
+            : {}),
+          onHandle: (successor) => {
+            current = successor;
+            handles.add(successor);
+          },
+        });
+      }
+      await vi.advanceTimersByTimeAsync(PLUGIN_SERVICE_REPLACEMENT_STOP_TIMEOUT_MS);
+      await siblingEntered.promise;
+      siblingRelease.resolve();
+      await expect(reloading).resolves.toBeUndefined();
+      await transfer;
+      expect(held.start).toHaveBeenCalledOnce();
+      expect(held.stop).toHaveBeenCalledOnce();
+      expect(watching).toBe(true);
+      expect(sibling.start).toHaveBeenCalledTimes(recovery === "deferred-handoff" ? 1 : 2);
+      expect(listPluginServiceHealthFailures(registry)).toMatchObject([
+        {
+          pluginId: "reload-owner",
+          serviceId: "held",
+          error: expect.stringContaining("timed out"),
+        },
+      ]);
+      expect(() =>
+        contexts[0]!.gatewayEvents!.emit("stale", {}, { scope: "operator.read" }),
+      ).toThrow("no longer active");
+      if (recovery === "shutdown" || recovery === "selective-stop") {
+        const stopping =
+          recovery === "shutdown"
+            ? current.stop()
+            : current.stop({ strict: true, pluginIds: new Set(["reload-owner"]) });
+        release.resolve();
+        await stopping;
+        await vi.advanceTimersByTimeAsync(0);
+        expect(held.start).toHaveBeenCalledOnce();
+        expect(watching).toBe(false);
+      } else if (recovery === "failed-cleanup") {
+        release.reject(new Error("cleanup refused"));
+        await vi.advanceTimersByTimeAsync(0);
+        expect(held.start).toHaveBeenCalledOnce();
+        expect(listPluginServiceHealthFailures(registry)).not.toEqual([]);
+      } else {
+        const latest = recovery === "retry" ? configFor("https://retry.example") : undefined;
+        const retrying = latest ? current.reload(latest, new Set([held.id])) : undefined;
+        release.resolve();
+        await retrying;
+        if (recovery === "deferred-handoff") {
+          await vi.advanceTimersByTimeAsync(0);
+          expect(held.start).toHaveBeenCalledOnce();
+          expect(watching).toBe(false);
+          current = await startPluginServices({
+            registry,
+            config: successorConfig,
+            previous: current,
+            broadcastPluginEvent: vi.fn(),
+          });
+          handles.add(current);
+        }
+        await restarted.promise;
+        await vi.advanceTimersByTimeAsync(0);
+        expect(held.start).toHaveBeenCalledTimes(2);
+        expect(held.stop).toHaveBeenCalledOnce();
+        expect(watching).toBe(true);
+        expect(contexts[1]!.config).toBe(latest ?? (handoff ? successorConfig : next));
+        expect(sibling.start).toHaveBeenCalledTimes(2);
+        expect(listPluginServiceHealthFailures(registry)).toEqual([]);
+        expect(() =>
+          contexts[1]!.gatewayEvents!.emit("restarted", {}, { scope: "operator.read" }),
+        ).not.toThrow();
+      }
+    } finally {
+      release.resolve();
+      siblingRelease.resolve();
+      await reloading;
+      await transfer;
+      await current.stop();
+      vi.useRealTimers();
+    }
   });
 
   it("rejects a queued reload when a selective stop has already claimed its service", async () => {

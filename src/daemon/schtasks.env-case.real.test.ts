@@ -5,7 +5,7 @@ import path from "node:path";
 import { PassThrough } from "node:stream";
 import { expectDefined } from "@openclaw/normalization-core";
 import { describe, expect, it, onTestFinished, vi } from "vitest";
-import { withTestTimeout } from "../../test/helpers/promise.js";
+import { withinTest, withTestTimeout } from "../../test/helpers/promise.js";
 import { getWindowsCmdExePath } from "../infra/windows-install-roots.js";
 import { readWindowsProcessArgsSync } from "../infra/windows-port-pids.js";
 import { WINDOWS_POWERSHELL_COLD_SPAWN_TIMEOUT_MS } from "../infra/windows-powershell-spawn.js";
@@ -46,6 +46,12 @@ vi.mock("node:child_process", async (importOriginal) => {
 describe.skipIf(process.platform !== "win32")("Windows launcher redirection ownership", () => {
   it.each([
     { message: "a >b & c", normalized: true, extraArgument: "", target: "" },
+    {
+      message: "quoted expansion",
+      normalized: true,
+      extraArgument: "",
+      target: '"%CD%\\gateway output.log"',
+    },
     { message: 'a "q" >b', normalized: false, extraArgument: "", target: "" },
     { message: "comma target", normalized: false, extraArgument: ",extra", target: "" },
     {
@@ -283,11 +289,7 @@ describe("Windows Startup fallback environment", () => {
       }
       // Join the owned instances even after an assertion fails. An uncertain
       // close retains their inputs instead of treating PID disappearance as cleanup.
-      await withTestTimeout(
-        Promise.all(children.map(({ closed }) => closed)),
-        10_000,
-        "Startup fixture child did not close; retaining its directory",
-      );
+      await Promise.all(children.map(({ closed }) => closed));
       await fs.rm(dir, { recursive: true });
     });
     const reportPath = path.join(dir, "child.json");
@@ -336,7 +338,7 @@ fs.renameSync(file + ".tmp", file);
       await startStartupEntry({ OPENCLAW_TASK_SCRIPT: scriptPath }, output);
       expect(children).toHaveLength(1);
       const { child, closed } = expectDefined(children[0], "Startup fixture child");
-      expect(await withTestTimeout(closed, 10_000, "Startup fixture child did not close")).toEqual({
+      expect(await withinTest(closed, context.signal)).toEqual({
         code: 0,
         signal: null,
       });
