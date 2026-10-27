@@ -1,181 +1,188 @@
 import type { Context, Model } from "openclaw/plugin-sdk/llm";
-import {
-  registerProviderPlugin,
-  requireRegisteredProvider,
-} from "openclaw/plugin-sdk/plugin-test-runtime";
+import * as plugins from "openclaw/plugin-sdk/plugin-test-runtime";
+import type { OpenClawConfig } from "openclaw/plugin-sdk/provider-onboard";
 import { buildOpenAICompletionsParams } from "openclaw/plugin-sdk/provider-transport-runtime";
-import { describe, expect, it, vi } from "vitest";
+import { assert, describe, expect, it } from "vitest";
 import { createRuntimeSpies } from "../test-support/runtime-spies.js";
 import stepfunPlugin from "./index.js";
 import manifest from "./openclaw.plugin.json" with { type: "json" };
-import {
-  STEPFUN_DEFAULT_MODEL_REF,
-  STEPFUN_PLAN_DEFAULT_MODEL_REF,
-  buildStepFunPlanProvider,
-  buildStepFunProvider,
-} from "./provider-catalog.js";
 
-function registerStepFun() {
-  return registerProviderPlugin({ plugin: stepfunPlugin, id: "stepfun", name: "StepFun" });
+const registerStepFun = () =>
+  plugins.registerProviderPlugin({ plugin: stepfunPlugin, id: "stepfun", name: "StepFun" });
+
+async function applyConfig(providerId: string, methodId: string, config: OpenClawConfig) {
+  const { providers } = await registerStepFun();
+  const provider = plugins.requireRegisteredProvider(providers, providerId);
+  const method = provider.auth.find((entry) => entry.id === methodId);
+  assert(method?.runNonInteractive && method.wizard?.choiceId, `Missing auth method ${methodId}`);
+  const result = await method.runNonInteractive({
+    authChoice: method.wizard.choiceId,
+    config,
+    baseConfig: config,
+    opts: {},
+    runtime: createRuntimeSpies(),
+    resolveApiKey: async () => ({ key: "fixture-value", source: "profile" as const }),
+    toApiKeyCredential: () => null,
+  });
+  assert(result, "StepFun setup did not return a configuration");
+  return result;
 }
 
-describe("stepfun provider registration", () => {
-  it("adds Step 5 Preview as the default without dropping existing rows", () => {
-    const standard = buildStepFunProvider();
-    const plan = buildStepFunPlanProvider();
-    const standardModel = standard.models?.find((model) => model.id === "step-3.7-flash");
-    const planModel = plan.models?.find((model) => model.id === "step-3.7-flash");
-    if (!standardModel) {
-      throw new Error("StepFun Standard catalog did not provide Step 3.7 Flash");
-    }
+const catalogModels = ["step-5-preview", "step-3.7-flash", "step-3.5-flash"];
+describe.each([
+  ["stepfun", "standard-api-key-intl", undefined, catalogModels],
+  ["stepfun-plan", "plan-api-key-cn", "merge", [...catalogModels, "step-3.5-flash-2603"]],
+] as const)("%s setup", (providerId, methodId, mode, rows) => {
+  const apply = (config: OpenClawConfig) => applyConfig(providerId, methodId, config);
 
-    expect(STEPFUN_DEFAULT_MODEL_REF).toBe("stepfun/step-5-preview");
-    expect(STEPFUN_PLAN_DEFAULT_MODEL_REF).toBe("stepfun-plan/step-5-preview");
-    const standardStep5 = standard.models?.find((model) => model.id === "step-5-preview");
-    const planStep5 = plan.models?.find((model) => model.id === "step-5-preview");
-    expect(standardStep5).toMatchObject({
-      name: "Step 5 Preview",
+  it("leaves ordinary rows runtime-owned and retains aliases", async () => {
+    const config = await apply({ models: { mode } });
+
+    expect(config.models?.providers?.[providerId]?.models).toEqual([]);
+    expect(config.agents?.defaults?.models?.[`${providerId}/step-3.7-flash`]).toEqual({});
+    const alias = config.agents?.defaults?.models?.[`${providerId}/step-5-preview`]?.alias;
+    expect(alias).toEqual(expect.any(String));
+    expect(await apply(config)).toEqual(config);
+  });
+
+  it("retains the shipped replace catalog", async () => {
+    const config = await apply({ models: { mode: "replace" } });
+    expect(config.models?.providers?.[providerId]?.models.map((model) => model.id)).toEqual(rows);
+  });
+});
+
+it("ships Step 5 Preview as the default and keeps Step 3.7 Flash facts", async () => {
+  const { providers } = await registerStepFun();
+  async function catalog(providerId: string) {
+    const registration = plugins.requireRegisteredProvider(providers, providerId);
+    const result = await registration.staticCatalog?.run({
+      config: {},
+      env: {},
+      resolveProviderApiKey: () => ({ apiKey: undefined }),
+      resolveProviderAuth: () => ({ apiKey: undefined, mode: "none", source: "none" }),
+    });
+    assert(result && "provider" in result, `Missing ${providerId} catalog`);
+    expect(registration.auth[0]?.starterModel).toBe(`${providerId}/step-5-preview`);
+    return result.provider;
+  }
+  const standard = await catalog("stepfun");
+  const plan = await catalog("stepfun-plan");
+  const standard35 = standard.models?.find((model) => model.id === "step-3.5-flash");
+  expect(standard35?.compat?.supportsReasoningEffort).not.toBe(true);
+  expect(standard35?.cost).toEqual({ input: 0.1, output: 0.3, cacheRead: 0.02, cacheWrite: 0 });
+  for (const [provider, cost] of [
+    [standard, { input: 1, output: 2.7, cacheRead: 0.1, cacheWrite: 0 }],
+    [plan, { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 }],
+  ] as const) {
+    const model = provider.models?.find((entry) => entry.id === "step-5-preview");
+    assert(model, "Missing Step 5 Preview");
+    expect(model).toMatchObject({
+      cost,
       reasoning: true,
       input: ["text", "image"],
       thinkingLevelMap: { off: "low", minimal: "low", xhigh: "high", max: "high" },
       contextWindow: 1048576,
       maxTokens: 65536,
-      cost: { input: 1, output: 2.7, cacheRead: 0.1, cacheWrite: 0 },
       compat: {
         supportsReasoningEffort: true,
         supportedReasoningEfforts: ["low", "medium", "high"],
         maxTokensField: "max_tokens",
       },
     });
-    expect(planStep5).toMatchObject({
-      contextWindow: 1048576,
-      maxTokens: 65536,
-      cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
-    });
-    const standard35 = standard.models?.find((model) => model.id === "step-3.5-flash");
-    expect(standard35?.compat?.supportsReasoningEffort).not.toBe(true);
-    expect(standard35?.cost).toEqual({ input: 0.1, output: 0.3, cacheRead: 0.02, cacheWrite: 0 });
-    const expected37 = {
+  }
+  for (const [provider, cost] of [
+    [standard, { input: 0.2, output: 1.15, cacheRead: 0.04, cacheWrite: 0 }],
+    [plan, { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 }],
+  ] as const) {
+    const model = provider.models?.find((entry) => entry.id === "step-3.7-flash");
+    assert(model, "Missing Step 3.7 Flash");
+    expect(model).toMatchObject({
+      cost,
       reasoning: true,
       input: ["text", "image"],
       thinkingLevelMap: { off: "low", minimal: "low", xhigh: "high", max: "high" },
       contextWindow: 262144,
       maxTokens: 262144,
       compat: {
-        supportsStore: false,
-        supportsDeveloperRole: false,
-        supportsUsageInStreaming: false,
         supportsReasoningEffort: true,
         supportsStrictMode: false,
         supportedReasoningEfforts: ["low", "medium", "high"],
-        maxTokensField: "max_tokens",
-        reasoningEffortMap: expect.objectContaining({ off: "low", medium: "medium", max: "high" }),
+        reasoningEffortMap: { off: "low", medium: "medium", max: "high" },
       },
-    };
-    expect(standardModel).toMatchObject({
-      ...expected37,
-      cost: { input: 0.2, output: 1.15, cacheRead: 0.04, cacheWrite: 0 },
     });
-    expect(planModel).toMatchObject({
-      ...expected37,
-      cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
-    });
-
     const transportModel = {
-      ...standardModel,
-      provider: "stepfun",
+      ...model,
+      provider: provider === standard ? "stepfun" : "stepfun-plan",
       api: "openai-completions",
-      baseUrl: standard.baseUrl,
+      baseUrl: provider.baseUrl,
     } as Model<"openai-completions">;
-    const context = {
-      systemPrompt: "system",
-      messages: [{ role: "user", content: "hi", timestamp: 1 }],
-    } as Context;
-    const lowPayload = buildOpenAICompletionsParams(transportModel, context, {
-      reasoning: standardModel.thinkingLevelMap?.off,
-      maxTokens: 128,
-    } as never);
+    const context: Context = { systemPrompt: "system", messages: [] };
+    const payloadFor = (reasoning: string | undefined, maxTokens?: number) =>
+      buildOpenAICompletionsParams(transportModel, context, { reasoning, maxTokens } as never);
+    const lowPayload = payloadFor(model.thinkingLevelMap?.off ?? undefined, 128);
     expect(lowPayload).toMatchObject({ reasoning_effort: "low", max_tokens: 128 });
-    expect(lowPayload).not.toHaveProperty("max_completion_tokens");
-    expect(lowPayload).not.toHaveProperty("store");
-    expect(lowPayload).not.toHaveProperty("stream_options");
-    expect(lowPayload.messages).toEqual(
-      expect.arrayContaining([expect.objectContaining({ role: "system", content: "system" })]),
-    );
-    expect(lowPayload.messages).not.toEqual(
-      expect.arrayContaining([expect.objectContaining({ role: "developer" })]),
-    );
-    expect(
-      buildOpenAICompletionsParams(transportModel, context, { reasoning: "high" } as never)
-        .reasoning_effort,
-    ).toBe("high");
-  });
-
-  it("keeps manifest auth choices aligned with runtime provider methods", async () => {
-    const { providers } = await registerStepFun();
-    const runtimeChoices = ["stepfun", "stepfun-plan"].flatMap((providerId) => {
-      const provider = requireRegisteredProvider(providers, providerId);
-      return provider.auth.map((method) => [provider.id, method.id, method.wizard?.choiceId]);
-    });
-
-    const manifestChoices = manifest.providerAuthChoices.map(({ provider, method, choiceId }) => [
-      provider,
-      method,
-      choiceId,
-    ]);
-
-    expect(runtimeChoices).toEqual(manifestChoices);
-    expect(manifest.setup.providers).toEqual([
-      { id: "stepfun", envVars: ["STEPFUN_API_KEY"] },
-      { id: "stepfun-plan", envVars: ["STEPFUN_API_KEY"] },
-    ]);
-  });
-
-  it.each([
-    { providerId: "stepfun", methodId: "standard-api-key-cn" },
-    { providerId: "stepfun-plan", methodId: "plan-api-key-intl" },
-  ])(
-    "preserves an existing primary when repeating $methodId onboarding",
-    async ({ providerId, methodId }) => {
-      const { providers } = await registerStepFun();
-      const provider = requireRegisteredProvider(providers, providerId);
-      const method = provider.auth.find((entry) => entry.id === methodId);
-      if (!method?.runNonInteractive || !method.wizard?.choiceId) {
-        throw new Error(`expected StepFun non-interactive auth method ${methodId}`);
-      }
-
-      const config = {
-        agents: {
-          defaults: {
-            model: {
-              primary: "anthropic/claude-sonnet-4-6",
-              fallbacks: ["openai/gpt-5.6-luna"],
-            },
-            models: { "anthropic/claude-sonnet-4-6": { alias: "Existing" } },
-          },
-        },
-      };
-
-      const result = await method.runNonInteractive({
-        authChoice: method.wizard.choiceId,
-        config,
-        baseConfig: config,
-        opts: {},
-        runtime: createRuntimeSpies(),
-        resolveApiKey: vi.fn(async () => ({ key: "fixture-value", source: "profile" as const })),
-        toApiKeyCredential: vi.fn(() => null),
-      });
-
-      const defaults = result?.agents?.defaults;
-      expect(defaults?.model).toEqual({
-        primary: "anthropic/claude-sonnet-4-6",
-        fallbacks: ["openai/gpt-5.6-luna"],
-      });
-      expect(defaults?.models?.["anthropic/claude-sonnet-4-6"]).toEqual({ alias: "Existing" });
-      expect(defaults?.models?.[`${providerId}/step-5-preview`]).toEqual(
-        expect.objectContaining({ alias: expect.any(String) }),
-      );
-      expect(result?.models?.providers?.[providerId]).toBeDefined();
-    },
-  );
+    for (const key of ["max_completion_tokens", "store", "stream_options"]) {
+      expect(lowPayload).not.toHaveProperty(key);
+    }
+    expect(lowPayload.messages).toContainEqual({ role: "system", content: "system" });
+    expect(lowPayload.messages).not.toContainEqual(expect.objectContaining({ role: "developer" }));
+    expect(payloadFor("high").reasoning_effort).toBe("high");
+  }
 });
+
+it("keeps manifest auth choices aligned with runtime provider methods", async () => {
+  const { providers } = await registerStepFun();
+  const runtimeChoices = ["stepfun", "stepfun-plan"].flatMap((providerId) => {
+    const provider = plugins.requireRegisteredProvider(providers, providerId);
+    return provider.auth.map((method) => [provider.id, method.id, method.wizard?.choiceId]);
+  });
+
+  const choices = manifest.providerAuthChoices.map((c) => [c.provider, c.method, c.choiceId]);
+  expect(runtimeChoices).toEqual(choices);
+  expect(manifest.setup.providers).toEqual([
+    { id: "stepfun", envVars: ["STEPFUN_API_KEY"] },
+    { id: "stepfun-plan", envVars: ["STEPFUN_API_KEY"] },
+  ]);
+});
+
+it.each([
+  ["stepfun", "standard-api-key-cn"],
+  ["stepfun-plan", "plan-api-key-intl"],
+])("preserves primary during %s/%s onboarding", async (providerId, methodId) => {
+  const primary = "anthropic/claude-sonnet-4-6";
+  const model = { primary, fallbacks: ["openai/gpt-5.6-luna"] };
+  const models = { [primary]: { alias: "Existing" } };
+  const config = { agents: { defaults: structuredClone({ model, models }) } };
+
+  const result = await applyConfig(providerId, methodId, config);
+  const defaults = result.agents?.defaults;
+  expect(defaults?.model).toEqual(model);
+  expect(defaults?.models?.[primary]).toEqual(models[primary]);
+  expect(defaults?.models?.[`${providerId}/step-5-preview`]).toMatchObject({
+    alias: expect.any(String),
+  });
+  expect(result.models?.providers?.[providerId]).toBeDefined();
+});
+
+it.each([
+  ["stepfun", "standard-api-key-intl", "StepFun"],
+  ["stepfun", "standard-api-key-cn", "StepFun"],
+  ["stepfun-plan", "plan-api-key-intl", "StepFun Plan"],
+  ["stepfun-plan", "plan-api-key-cn", "StepFun Plan"],
+])(
+  "keeps an existing %s/%s alias on the model that already owned it",
+  async (providerId, methodId, alias) => {
+    const priorRef = `${providerId}/step-3.5-flash`;
+    // Runtime alias keys are trimmed + lowercased, so the guard must normalize the
+    // same way or a padded legacy alias looks unowned and the new default steals it.
+    for (const priorAlias of [alias, ` ${alias} `]) {
+      const result = await applyConfig(providerId, methodId, {
+        agents: { defaults: { model: priorRef, models: { [priorRef]: { alias: priorAlias } } } },
+      });
+      const models = result.agents?.defaults?.models ?? {};
+      expect(models[priorRef]?.alias).toBe(priorAlias);
+      expect(models[`${providerId}/step-5-preview`]?.alias).toBeUndefined();
+      expect(result.agents?.defaults?.model).toBe(priorRef);
+    }
+  },
+);

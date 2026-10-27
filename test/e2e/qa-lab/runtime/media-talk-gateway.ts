@@ -74,7 +74,7 @@ const SCENARIOS = {
       SOURCE_PATH,
       "src/agents/embedded-agent-runner/run/attempt-tool-run-context.ts",
       "extensions/codex/src/app-server/dynamic-tool-build.ts",
-      "src/infra/outbound/message-action-tts.ts",
+      "src/infra/outbound/message-action-send.ts",
     ],
   },
   "active-talk-agent-run-status": {
@@ -344,6 +344,7 @@ async function runWebchatAutoTtsProof(options: ProducerOptions): Promise<string>
   try {
     gateway = await gatewayOwner.start({
       repoRoot: options.repoRoot,
+      initializeCurrentRuntimeState: true,
       useRepoCli: true,
       providerBaseUrl: `${mock.baseUrl}/v1`,
       providerMode: "mock-openai",
@@ -678,6 +679,7 @@ async function runActiveTalkAgentRunProof(options: ProducerOptions): Promise<str
   try {
     gateway = await gatewayOwner.start({
       repoRoot: options.repoRoot,
+      initializeCurrentRuntimeState: true,
       useRepoCli: true,
       providerBaseUrl: `${mock.baseUrl}/v1`,
       providerMode: "mock-openai",

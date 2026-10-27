@@ -4,7 +4,7 @@ import {
   syncScrollMargin,
   type createPositionRailGutter,
 } from "./chat-transcript-geometry.ts";
-import { unscaledBorderBox } from "./chat-transcript-layout-owner.ts";
+import { type TranscriptLayoutOwner, unscaledBorderBox } from "./chat-transcript-layout-owner.ts";
 
 type ViewportRectOwner = {
   getScrollElement(): HTMLDivElement | null;
@@ -14,7 +14,8 @@ type ViewportRectOwner = {
   measureConnectedRows(): boolean;
   queueRowMeasure(): void;
   onViewportResize(): void;
-  requestUpdate(): void;
+  layout: TranscriptLayoutOwner;
+  invalidate(): void;
 };
 
 function sameDimension(previous: number | null | undefined, next: number): boolean {
@@ -74,6 +75,14 @@ export class TranscriptViewportRect {
       }
       delivered = true;
       const railGeometry = this.owner.positionRail.read();
+      if (railGeometry) {
+        this.owner.layout.restoreRows(
+          instance,
+          railGeometry.columnWidth,
+          rect.width,
+          railGeometry.gutter,
+        );
+      }
       this.owner.commitComposerResize();
       const widthChanged =
         this.observedWidth !== null && !sameDimension(this.observedWidth, rect.width);
@@ -92,7 +101,7 @@ export class TranscriptViewportRect {
       this.owner.positionRail.sync(railGeometry);
       if (widthChanged || heightChanged) {
         this.owner.onViewportResize();
-        this.owner.requestUpdate();
+        this.owner.invalidate();
       }
     };
     const syncRect = () => {
